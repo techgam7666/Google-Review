@@ -83,9 +83,9 @@ export function HomePage() {
     variationIndex: 0,
   });
 
-  const scrollToPricing = (e: React.MouseEvent<HTMLAnchorElement>) => {
+  const scrollToSection = (e: React.MouseEvent<HTMLAnchorElement>, sectionId: string) => {
     e.preventDefault();
-    const target = document.getElementById('pricing');
+    const target = document.getElementById(sectionId);
     if (target) {
       target.scrollIntoView({ behavior: 'smooth' });
     }
@@ -118,19 +118,20 @@ export function HomePage() {
               <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 pt-1">
                 <a
                   href="#pricing"
-                  onClick={scrollToPricing}
+                  onClick={(e) => scrollToSection(e, 'pricing')}
                   className="inline-flex items-center justify-center gap-2 px-6 py-3 text-sm font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors duration-150 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
                 >
                   <span>Get Shop QR Scanner</span>
                   <ArrowRight className="w-4 h-4" />
                 </a>
 
-                <Link
-                  to="/review/demo"
+                <a
+                  href="#how-it-works"
+                  onClick={(e) => scrollToSection(e, 'how-it-works')}
                   className="inline-flex items-center justify-center px-6 py-3 text-sm font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 hover:text-slate-950 transition-colors duration-150 whitespace-nowrap shrink-0"
                 >
-                  Generate a Demo Review
-                </Link>
+                  See How It Works
+                </a>
               </div>
 
               <div className="pt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
@@ -238,10 +239,10 @@ export function HomePage() {
                       Matches {previewRating}-star sentiment honestly
                     </span>
                     <Link
-                      to="/review/demo"
+                      to="/dashboard"
                       className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-600 hover:text-indigo-700 whitespace-nowrap shrink-0"
                     >
-                      <span>Test live AI generator</span>
+                      <span>Create your shop scanner</span>
                       <ArrowRight className="w-3.5 h-3.5" />
                     </Link>
                   </div>
@@ -703,12 +704,13 @@ export function HomePage() {
                 <span>Start Shop Subscription</span>
                 <ArrowRight className="w-4 h-4" />
               </Link>
-              <Link
-                to="/review/demo"
+              <a
+                href="#pricing"
+                onClick={(e) => scrollToSection(e, 'pricing')}
                 className="inline-flex items-center justify-center px-5 py-3 text-sm font-semibold text-white border border-slate-700 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
               >
-                Try Customer Demo
-              </Link>
+                Compare Monthly Plans
+              </a>
             </div>
           </div>
         </div>

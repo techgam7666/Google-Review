@@ -18,6 +18,16 @@ export function Footer() {
             <h3 className="text-sm font-semibold text-slate-900">Platform</h3>
             <ul className="space-y-2 text-sm text-slate-600">
               <li>
+                <Link to="/#how-it-works" className="hover:text-slate-900 transition-colors">
+                  How It Works
+                </Link>
+              </li>
+              <li>
+                <Link to="/#features" className="hover:text-slate-900 transition-colors">
+                  Features
+                </Link>
+              </li>
+              <li>
                 <Link to="/#pricing" className="hover:text-slate-900 transition-colors">
                   Monthly Shop Plans
                 </Link>
@@ -25,16 +35,6 @@ export function Footer() {
               <li>
                 <Link to="/dashboard" className="hover:text-slate-900 transition-colors">
                   Merchant Portal &amp; QR Setup
-                </Link>
-              </li>
-              <li>
-                <Link to="/review/demo" className="hover:text-slate-900 transition-colors">
-                  Customer Scanner Demo
-                </Link>
-              </li>
-              <li>
-                <Link to="/business-demo" className="hover:text-slate-900 transition-colors">
-                  Sandbox Analytics Demo
                 </Link>
               </li>
             </ul>

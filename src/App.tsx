@@ -9,7 +9,6 @@ import { Footer } from './components/Footer';
 import { Navbar } from './components/Navbar';
 import { AuthProvider } from './context/AuthContext';
 import { BusinessProvider } from './context/BusinessContext';
-import { BusinessDashboardPage } from './pages/BusinessDashboardPage';
 import { HomePage } from './pages/HomePage';
 import { MerchantWorkspacePage } from './pages/MerchantWorkspacePage';
 import { ReviewGeneratorPage } from './pages/ReviewGeneratorPage';
@@ -38,9 +37,9 @@ export default function App() {
               <Routes>
                 <Route path="/" element={<HomePage />} />
                 <Route path="/dashboard" element={<MerchantWorkspacePage />} />
-                <Route path="/review/demo" element={<ReviewGeneratorPage />} />
+                <Route path="/review/demo" element={<Navigate to="/dashboard" replace />} />
+                <Route path="/business-demo" element={<Navigate to="/dashboard" replace />} />
                 <Route path="/review/:businessSlug" element={<ReviewGeneratorPage />} />
-                <Route path="/business-demo" element={<BusinessDashboardPage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Routes>
             </main>

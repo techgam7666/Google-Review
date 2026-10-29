@@ -24,8 +24,6 @@ export function Navbar() {
     navigate(`/#${sectionId}`);
   };
 
-  const isReviewPage = location.pathname.startsWith('/review');
-  const isSandboxPage = location.pathname === '/business-demo';
   const isWorkspacePage = location.pathname === '/dashboard';
 
   return (
@@ -40,7 +38,7 @@ export function Navbar() {
           ReviewEase AI
         </Link>
 
-        {/* Zone 2: 5 concise single-line navigation links */}
+        {/* Zone 2: 4 concise single-line navigation links */}
         <nav
           aria-label="Primary"
           className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600"
@@ -53,28 +51,19 @@ export function Navbar() {
             How It Works
           </a>
           <a
+            href="/#features"
+            onClick={(e) => handleSectionLink(e, 'features')}
+            className="hover:text-slate-950 hover:underline underline-offset-4 transition-colors duration-150 whitespace-nowrap shrink-0"
+          >
+            Features
+          </a>
+          <a
             href="/#pricing"
             onClick={(e) => handleSectionLink(e, 'pricing')}
             className="hover:text-slate-950 hover:underline underline-offset-4 transition-colors duration-150 whitespace-nowrap shrink-0"
           >
             Pricing
           </a>
-          <Link
-            to="/review/demo"
-            className={`hover:text-slate-950 hover:underline underline-offset-4 transition-colors duration-150 whitespace-nowrap shrink-0 ${
-              isReviewPage ? 'text-indigo-600 font-semibold' : ''
-            }`}
-          >
-            Review Demo
-          </Link>
-          <Link
-            to="/business-demo"
-            className={`hover:text-slate-950 hover:underline underline-offset-4 transition-colors duration-150 whitespace-nowrap shrink-0 ${
-              isSandboxPage ? 'text-indigo-600 font-semibold' : ''
-            }`}
-          >
-            Business Demo
-          </Link>
           <Link
             to="/dashboard"
             className={`hover:text-slate-950 hover:underline underline-offset-4 transition-colors duration-150 whitespace-nowrap shrink-0 ${
@@ -117,30 +106,19 @@ export function Navbar() {
             How It Works
           </a>
           <a
+            href="/#features"
+            onClick={(e) => handleSectionLink(e, 'features')}
+            className="block px-3 py-2.5 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-slate-950"
+          >
+            Features
+          </a>
+          <a
             href="/#pricing"
             onClick={(e) => handleSectionLink(e, 'pricing')}
             className="block px-3 py-2.5 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-slate-950"
           >
             Pricing
           </a>
-          <Link
-            to="/review/demo"
-            onClick={() => setMobileOpen(false)}
-            className={`block px-3 py-2.5 rounded-lg text-sm font-medium ${
-              isReviewPage ? 'bg-indigo-50 text-indigo-700 font-semibold' : 'text-slate-700 hover:bg-slate-50'
-            }`}
-          >
-            Review Demo
-          </Link>
-          <Link
-            to="/business-demo"
-            onClick={() => setMobileOpen(false)}
-            className={`block px-3 py-2.5 rounded-lg text-sm font-medium ${
-              isSandboxPage ? 'bg-indigo-50 text-indigo-700 font-semibold' : 'text-slate-700 hover:bg-slate-50'
-            }`}
-          >
-            Business Demo
-          </Link>
           <Link
             to="/dashboard"
             onClick={() => setMobileOpen(false)}

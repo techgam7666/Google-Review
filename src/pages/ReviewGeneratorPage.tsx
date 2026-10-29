@@ -8,17 +8,12 @@ import {
   ExternalLink,
   Loader2,
   RefreshCw,
-  Settings2,
   Sparkles,
   Star,
 } from 'lucide-react';
-import cafeHeaderImg from '../assets/images/urban_cafe_interior_1793280830493.jpg';
-import { ResilientImage } from '../components/ResilientImage';
 import { useAuth } from '../context/AuthContext';
-import { useBusiness } from '../context/BusinessContext';
 import {
   createAnonymousVisitId,
-  extractOrNormalizeGoogleUrl,
   fetchPublicBusinessBySlug,
   recordRealCustomerSessionEvent,
 } from '../services/firestoreService';
@@ -102,13 +97,10 @@ function isValidHttpUrl(value: string): boolean {
 export function ReviewGeneratorPage() {
   const { businessSlug } = useParams<{ businessSlug?: string }>();
   const { user } = useAuth();
-  const { profile, updateProfile, recordLocalDraftSession } = useBusiness();
-
-  const isDemoRoute = !businessSlug || businessSlug === 'demo';
 
   // Firestore real business resolution state
   const [realBusiness, setRealBusiness] = useState<RealBusinessRecord | null>(null);
-  const [resolvingBusiness, setResolvingBusiness] = useState<boolean>(!isDemoRoute);
+  const [resolvingBusiness, setResolvingBusiness] = useState<boolean>(true);
   const [notFoundInCloud, setNotFoundInCloud] = useState<boolean>(false);
 
   // Ephemeral anonymous visit ID for grouping draft -> copy -> Google handoff
@@ -117,10 +109,10 @@ export function ReviewGeneratorPage() {
   useEffect(() => {
     visitIdRef.current = createAnonymousVisitId();
 
-    if (isDemoRoute) {
+    if (!businessSlug || businessSlug === 'demo') {
       setRealBusiness(null);
       setResolvingBusiness(false);
-      setNotFoundInCloud(false);
+      setNotFoundInCloud(true);
       return;
     }
 
@@ -134,9 +126,6 @@ export function ReviewGeneratorPage() {
         if (found && found.isActive) {
           setRealBusiness(found);
           setNotFoundInCloud(false);
-        } else if (businessSlug === profile.slug) {
-          setRealBusiness(null);
-          setNotFoundInCloud(false);
         } else {
           setRealBusiness(null);
           setNotFoundInCloud(true);
@@ -146,7 +135,7 @@ export function ReviewGeneratorPage() {
       .catch(() => {
         if (!cancelled) {
           setRealBusiness(null);
-          setNotFoundInCloud(businessSlug !== profile.slug);
+          setNotFoundInCloud(true);
           setResolvingBusiness(false);
         }
       });
@@ -154,37 +143,12 @@ export function ReviewGeneratorPage() {
     return () => {
       cancelled = true;
     };
-  }, [businessSlug, isDemoRoute, profile.slug]);
-
-  const activeMerchant = useMemo(() => {
-    if (realBusiness) {
-      return {
-        name: realBusiness.name,
-        category: realBusiness.category,
-        locationLabel: realBusiness.locationLabel,
-        slug: realBusiness.slug,
-        googleReviewUrl: realBusiness.googleReviewUrl,
-        ownerId: realBusiness.ownerId,
-        subscriptionEndsAtMs: realBusiness.subscriptionEndsAtMs,
-        isLiveCloud: true,
-      };
-    }
-    return {
-      name: profile.name,
-      category: profile.category,
-      locationLabel: 'Sample Demo Profile',
-      slug: profile.slug,
-      googleReviewUrl: profile.googleReviewUrl,
-      ownerId: null,
-      subscriptionEndsAtMs: undefined,
-      isLiveCloud: false,
-    };
-  }, [realBusiness, profile]);
+  }, [businessSlug]);
 
   const isSubscriptionExpired = Boolean(
-    activeMerchant.isLiveCloud &&
-      typeof activeMerchant.subscriptionEndsAtMs === 'number' &&
-      activeMerchant.subscriptionEndsAtMs < Date.now()
+    realBusiness &&
+      typeof realBusiness.subscriptionEndsAtMs === 'number' &&
+      realBusiness.subscriptionEndsAtMs < Date.now()
   );
 
   // Step 1: Rating
@@ -209,19 +173,16 @@ export function ReviewGeneratorPage() {
   // Step 4: Copy & Handoff
   const [copiedState, setCopiedState] = useState<'idle' | 'copied' | 'error'>('idle');
   const [clipboardError, setClipboardError] = useState<string | null>(null);
-  const [showUrlSettings, setShowUrlSettings] = useState<boolean>(false);
-  const [urlInput, setUrlInput] = useState<string>(profile.googleReviewUrl);
-  const [urlSaveNotice, setUrlSaveNotice] = useState<string | null>(null);
 
   const step3Ref = useRef<HTMLDivElement | null>(null);
 
   const sentimentBucket: SentimentBucket | null = rating > 0 ? getSentimentBucket(rating) : null;
   const activePrompts = useMemo(
     () =>
-      sentimentBucket
-        ? getCategoryAwarePrompts(sentimentBucket, activeMerchant.category)
+      sentimentBucket && realBusiness
+        ? getCategoryAwarePrompts(sentimentBucket, realBusiness.category)
         : null,
-    [sentimentBucket, activeMerchant.category]
+    [sentimentBucket, realBusiness]
   );
 
   const handleSelectRating = (newRating: number) => {
@@ -278,11 +239,13 @@ export function ReviewGeneratorPage() {
     setCopiedState('idle');
     setIsGenerating(true);
 
+    if (!realBusiness) return;
+
     try {
       const result = await generateCustomerReview({
-        businessName: activeMerchant.name,
-        category: activeMerchant.category,
-        locationLabel: activeMerchant.locationLabel,
+        businessName: realBusiness.name,
+        category: realBusiness.category,
+        locationLabel: realBusiness.locationLabel,
         rating,
         language: targetLang,
         primaryAnswer: q1,
@@ -297,24 +260,15 @@ export function ReviewGeneratorPage() {
 
       const usedPrompts = Boolean(q1.trim() || q2.trim());
 
-      if (activeMerchant.isLiveCloud && activeMerchant.ownerId) {
-        void recordRealCustomerSessionEvent({
-          businessSlug: activeMerchant.slug,
-          businessOwnerId: activeMerchant.ownerId,
-          visitId: visitIdRef.current,
-          rating,
-          language: targetLang,
-          usedOptionalPrompts: usedPrompts,
-          stage: 'draft_generated',
-        });
-      } else {
-        recordLocalDraftSession({
-          rating,
-          language: targetLang,
-          usedOptionalPrompts: usedPrompts,
-          actionTaken: 'Draft Generated',
-        });
-      }
+      void recordRealCustomerSessionEvent({
+        businessSlug: realBusiness.slug,
+        businessOwnerId: realBusiness.ownerId,
+        visitId: visitIdRef.current,
+        rating,
+        language: targetLang,
+        usedOptionalPrompts: usedPrompts,
+        stage: 'draft_generated',
+      });
 
       setTimeout(() => {
         step3Ref.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -345,26 +299,17 @@ export function ReviewGeneratorPage() {
     const result = await copyTextToClipboard(reviewText);
     if (result.ok) {
       setCopiedState('copied');
-      if (rating >= 1) {
+      if (rating >= 1 && realBusiness) {
         const usedPrompts = Boolean(primaryAnswer.trim() || secondaryAnswer.trim());
-        if (activeMerchant.isLiveCloud && activeMerchant.ownerId) {
-          void recordRealCustomerSessionEvent({
-            businessSlug: activeMerchant.slug,
-            businessOwnerId: activeMerchant.ownerId,
-            visitId: visitIdRef.current,
-            rating,
-            language,
-            usedOptionalPrompts: usedPrompts,
-            stage: 'copied_review',
-          });
-        } else {
-          recordLocalDraftSession({
-            rating,
-            language,
-            usedOptionalPrompts: usedPrompts,
-            actionTaken: 'Drafted & Copied',
-          });
-        }
+        void recordRealCustomerSessionEvent({
+          businessSlug: realBusiness.slug,
+          businessOwnerId: realBusiness.ownerId,
+          visitId: visitIdRef.current,
+          rating,
+          language,
+          usedOptionalPrompts: usedPrompts,
+          stage: 'copied_review',
+        });
       }
       setTimeout(() => {
         setCopiedState((prev) => (prev === 'copied' ? 'idle' : prev));
@@ -376,40 +321,18 @@ export function ReviewGeneratorPage() {
   };
 
   const handleOpenGoogleClick = () => {
-    if (rating >= 1) {
+    if (rating >= 1 && realBusiness) {
       const usedPrompts = Boolean(primaryAnswer.trim() || secondaryAnswer.trim());
-      if (activeMerchant.isLiveCloud && activeMerchant.ownerId) {
-        void recordRealCustomerSessionEvent({
-          businessSlug: activeMerchant.slug,
-          businessOwnerId: activeMerchant.ownerId,
-          visitId: visitIdRef.current,
-          rating,
-          language,
-          usedOptionalPrompts: usedPrompts,
-          stage: 'opened_google',
-        });
-      } else {
-        recordLocalDraftSession({
-          rating,
-          language,
-          usedOptionalPrompts: usedPrompts,
-          actionTaken: 'Opened Google Link',
-        });
-      }
+      void recordRealCustomerSessionEvent({
+        businessSlug: realBusiness.slug,
+        businessOwnerId: realBusiness.ownerId,
+        visitId: visitIdRef.current,
+        rating,
+        language,
+        usedOptionalPrompts: usedPrompts,
+        stage: 'opened_google',
+      });
     }
-  };
-
-  const handleSaveDemoGoogleUrl = (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleaned = extractOrNormalizeGoogleUrl(urlInput);
-    if (!isValidHttpUrl(cleaned)) {
-      setUrlSaveNotice('Please enter a valid Google Maps or web URL.');
-      return;
-    }
-    setUrlInput(cleaned);
-    updateProfile({ googleReviewUrl: cleaned });
-    setUrlSaveNotice('Google review destination URL updated.');
-    setTimeout(() => setUrlSaveNotice(null), 3000);
   };
 
   // Loading Skeleton while resolving a real QR slug from Firestore
@@ -425,7 +348,8 @@ export function ReviewGeneratorPage() {
   }
 
   // Unclaimed or Paused Business Slug Screen
-  if (notFoundInCloud && businessSlug) {
+  if (notFoundInCloud || !realBusiness) {
+    const targetSlug = businessSlug && businessSlug !== 'demo' ? businessSlug : 'your-shop';
     return (
       <div className="min-h-[calc(100vh-4rem)] bg-slate-50/70 py-14">
         <div className="max-w-xl mx-auto px-4 sm:px-6">
@@ -436,23 +360,23 @@ export function ReviewGeneratorPage() {
             <p className="text-sm text-slate-600 leading-relaxed">
               No active shop scanner was found at{' '}
               <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded text-slate-800">
-                /review/{businessSlug}
+                /review/{targetSlug}
               </code>
               . If you own this shop, you can subscribe and claim this exact scanner URL right now.
             </p>
             <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
               <Link
-                to={`/dashboard?claim=${encodeURIComponent(businessSlug)}`}
+                to={`/dashboard?claim=${encodeURIComponent(targetSlug)}`}
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 transition-colors"
               >
-                <span>Claim /review/{businessSlug}</span>
+                <span>Claim /review/{targetSlug}</span>
                 <ArrowRight className="w-4 h-4" />
               </Link>
               <Link
-                to="/review/demo"
+                to="/"
                 className="w-full sm:w-auto inline-flex items-center justify-center px-5 py-2.5 text-sm font-medium text-slate-700 bg-slate-100 rounded-xl hover:bg-slate-200/80 transition-colors"
               >
-                Try Sample Demo Page
+                Back to Homepage
               </Link>
             </div>
           </div>
@@ -461,9 +385,9 @@ export function ReviewGeneratorPage() {
     );
   }
 
-  const effectiveGoogleUrl = isValidHttpUrl(activeMerchant.googleReviewUrl)
-    ? activeMerchant.googleReviewUrl
-    : 'https://search.google.com/local/reviews?q=The+Urban+Cafe';
+  const effectiveGoogleUrl = isValidHttpUrl(realBusiness.googleReviewUrl)
+    ? realBusiness.googleReviewUrl
+    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(realBusiness.name)}`;
 
   // Expired Monthly Subscription Screen
   if (isSubscriptionExpired) {
@@ -472,7 +396,7 @@ export function ReviewGeneratorPage() {
         <div className="max-w-xl mx-auto px-4 sm:px-6">
           <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 text-center space-y-4">
             <h1 className="text-xl sm:text-2xl font-bold text-slate-950">
-              {activeMerchant.name}
+              {realBusiness.name}
             </h1>
             <p className="text-sm text-slate-600 leading-relaxed">
               AI review drafting on this QR scanner is temporarily paused while the shop&apos;s monthly ReviewEase AI subscription is awaiting renewal. You can still open their Google page directly below.
@@ -501,128 +425,45 @@ export function ReviewGeneratorPage() {
   }
 
   const displayedStars = hoveredRating || rating;
-  const isOwnerViewing =
-    Boolean(user && activeMerchant.isLiveCloud && activeMerchant.ownerId === user.uid);
+  const isOwnerViewing = Boolean(user && realBusiness.ownerId === user.uid);
 
   return (
     <div className="min-h-[calc(100vh-4rem)] bg-slate-50/70 py-6 sm:py-10">
       <div className="max-w-2xl mx-auto px-4 sm:px-6 space-y-6">
         {/* Merchant Profile Header Card */}
         <div className="rounded-2xl border border-slate-200 bg-white overflow-hidden">
-          {!activeMerchant.isLiveCloud ? (
-            <div className="h-28 sm:h-36 w-full relative overflow-hidden bg-slate-100">
-              <ResilientImage
-                src={cafeHeaderImg}
-                alt={`${activeMerchant.name} interior`}
-                fallbackLabel={activeMerchant.name}
-                className="w-full h-full object-cover"
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-black/25 to-transparent" />
-              <div className="absolute bottom-3 left-4 right-4 sm:left-6 sm:right-6">
-                <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
-                  {activeMerchant.name}
+          <div className="p-5 sm:p-6 bg-white">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <h1 className="text-xl sm:text-2xl font-bold text-slate-950 tracking-tight">
+                  {realBusiness.name}
                 </h1>
-                <div className="flex flex-wrap items-center gap-1.5 text-xs text-slate-200">
-                  <span>{activeMerchant.category}</span>
-                  <span aria-hidden="true">·</span>
-                  <span>Interactive Demo</span>
+                <div className="flex flex-wrap items-center gap-1.5 text-xs text-slate-500">
+                  <span>{realBusiness.category}</span>
+                  {realBusiness.locationLabel && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span>{realBusiness.locationLabel}</span>
+                    </>
+                  )}
                 </div>
               </div>
+              {isOwnerViewing && (
+                <Link
+                  to="/dashboard"
+                  className="text-xs font-semibold text-indigo-600 hover:text-indigo-700 whitespace-nowrap shrink-0"
+                >
+                  Manage Shop →
+                </Link>
+              )}
             </div>
-          ) : (
-            <div className="p-5 sm:p-6 bg-white">
-              <div className="flex items-start justify-between gap-4">
-                <div className="space-y-1">
-                  <h1 className="text-xl sm:text-2xl font-bold text-slate-950 tracking-tight">
-                    {activeMerchant.name}
-                  </h1>
-                  <div className="flex flex-wrap items-center gap-1.5 text-xs text-slate-500">
-                    <span>{activeMerchant.category}</span>
-                    {activeMerchant.locationLabel && (
-                      <>
-                        <span aria-hidden="true">·</span>
-                        <span>{activeMerchant.locationLabel}</span>
-                      </>
-                    )}
-                  </div>
-                </div>
-                {isOwnerViewing && (
-                  <Link
-                    to="/dashboard"
-                    className="text-xs font-semibold text-indigo-600 hover:text-indigo-700 whitespace-nowrap shrink-0"
-                  >
-                    Manage Shop →
-                  </Link>
-                )}
-              </div>
-            </div>
-          )}
+          </div>
 
-          {/* Subtitle / Demo URL Config */}
           <div className="px-4 py-3 sm:px-6 bg-slate-50/60 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs">
             <span className="text-slate-600">
               Share your honest experience in your own words. Takes under 30 seconds.
             </span>
-
-            {!activeMerchant.isLiveCloud && (
-              <button
-                type="button"
-                onClick={() => {
-                  setUrlInput(activeMerchant.googleReviewUrl);
-                  setShowUrlSettings((prev) => !prev);
-                  setUrlSaveNotice(null);
-                }}
-                className="inline-flex items-center gap-1.5 font-medium text-slate-600 hover:text-indigo-600 transition-colors whitespace-nowrap shrink-0"
-              >
-                <Settings2 className="w-3.5 h-3.5" />
-                <span>{showUrlSettings ? 'Hide URL Config' : 'Configure Demo URL'}</span>
-              </button>
-            )}
           </div>
-
-          {!activeMerchant.isLiveCloud && showUrlSettings && (
-            <form
-              onSubmit={handleSaveDemoGoogleUrl}
-              className="px-4 py-4 sm:px-6 border-t border-slate-200 bg-slate-50/80 space-y-2.5"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <label htmlFor="demo-google-url" className="text-xs font-semibold text-slate-800">
-                  Configurable Google Maps / Review URL (Demo)
-                </label>
-                <Link
-                  to="/dashboard"
-                  className="text-xs font-medium text-indigo-600 hover:text-indigo-700 whitespace-nowrap shrink-0"
-                >
-                  Create Real Shop QR →
-                </Link>
-              </div>
-              <div className="flex flex-col sm:flex-row gap-2">
-                <input
-                  id="demo-google-url"
-                  type="text"
-                  value={urlInput}
-                  onChange={(e) => setUrlInput(e.target.value)}
-                  placeholder="https://maps.app.goo.gl/... or https://g.page/r/.../review"
-                  className="flex-1 min-w-0 px-3 py-2 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent"
-                />
-                <button
-                  type="submit"
-                  className="px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-                >
-                  Save URL
-                </button>
-              </div>
-              {urlSaveNotice && (
-                <p
-                  className={`text-xs ${
-                    urlSaveNotice.includes('valid') ? 'text-red-600' : 'text-emerald-700'
-                  }`}
-                >
-                  {urlSaveNotice}
-                </p>
-              )}
-            </form>
-          )}
         </div>
 
         {/* Error Alert */}
@@ -643,7 +484,7 @@ export function ReviewGeneratorPage() {
         >
           <div className="flex items-baseline justify-between gap-2">
             <h2 id="step-1-heading" className="text-base sm:text-lg font-semibold text-slate-900">
-              1. How was your experience at {activeMerchant.name}?
+              1. How was your experience at {realBusiness.name}?
             </h2>
             {rating > 0 && (
               <span className="text-xs font-mono font-medium text-slate-600 tabular-nums shrink-0">
