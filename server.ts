@@ -1,16 +1,8 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 import express, { type Request, type Response } from 'express';
-import { initializeApp, type FirebaseApp } from 'firebase/app';
-import {
-  doc,
-  getDoc,
-  getFirestore,
-  serverTimestamp,
-  setDoc,
-  Timestamp,
-  type Firestore,
-} from 'firebase/firestore';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -40,6 +32,12 @@ interface SessionFallbackBody {
   stage?: 'draft_generated' | 'copied_review' | 'opened_google';
 }
 
+interface SignupBody {
+  email?: string;
+  password?: string;
+  fullName?: string;
+}
+
 function isGeminiConfigured(): boolean {
   const key = process.env.GEMINI_API_KEY?.trim();
   return Boolean(key && key !== 'MY_GEMINI_API_KEY' && key.length > 8);
@@ -66,37 +64,96 @@ function getGeminiClient(): GoogleGenAI | null {
   return geminiClient;
 }
 
-// Unauthenticated server-side Firestore client (strictly governed by firestore.rules)
-// used as a resilient fallback when a customer's browser blocks googleapis.com.
-let serverFirebaseApp: FirebaseApp | null = null;
-let serverFirestoreDb: Firestore | null = null;
+const SUPABASE_URL =
+  process.env.SUPABASE_URL?.trim() ||
+  process.env.VITE_SUPABASE_URL?.trim() ||
+  'https://qfftaewsktgvwuqoomsn.supabase.co';
 
-function getServerFirestore(): Firestore | null {
-  if (serverFirestoreDb) return serverFirestoreDb;
+const SUPABASE_PUBLISHABLE_KEY =
+  process.env.SUPABASE_PUBLISHABLE_KEY?.trim() ||
+  process.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim() ||
+  'sb_publishable_k1c1nN3jaOqVGhnxqoHIVg_r8qsOnBw';
+
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY?.trim() || '';
+const SUPABASE_JWKS_URL =
+  process.env.SUPABASE_JWKS_URL?.trim() || `${SUPABASE_URL}/auth/v1/.well-known/jwks.json`;
+
+let supabaseServerClient: SupabaseClient | null = null;
+function getSupabaseServer(): SupabaseClient | null {
+  if (supabaseServerClient) return supabaseServerClient;
+  const activeKey = SUPABASE_SECRET_KEY || SUPABASE_PUBLISHABLE_KEY;
+  if (!SUPABASE_URL || !activeKey) return null;
+  supabaseServerClient = createClient(SUPABASE_URL, activeKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+  return supabaseServerClient;
+}
+
+let cachedJwks: { keys: Array<crypto.JsonWebKey & { kid?: string; alg?: string }> } | null = null;
+let cachedJwksAt = 0;
+
+async function verifySupabaseJwtViaJwks(token: string): Promise<{ sub: string; email?: string } | null> {
   try {
-    const configPath = path.join(__dirname, 'firebase-applet-config.json');
-    if (!fs.existsSync(configPath)) return null;
-    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8')) as {
-      projectId?: string;
-      apiKey?: string;
-      appId?: string;
-      firestoreDatabaseId?: string;
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as {
+      kid?: string;
+      alg?: string;
     };
-    if (!raw.projectId || !raw.apiKey) return null;
-    serverFirebaseApp = initializeApp(raw, 'server-public-proxy');
-    serverFirestoreDb = raw.firestoreDatabaseId
-      ? getFirestore(serverFirebaseApp, raw.firestoreDatabaseId)
-      : getFirestore(serverFirebaseApp);
-    return serverFirestoreDb;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as {
+      sub?: string;
+      email?: string;
+      exp?: number;
+    };
+
+    if (payload.exp && payload.exp * 1000 < Date.now()) {
+      return null;
+    }
+
+    if (!cachedJwks || Date.now() - cachedJwksAt > 10 * 60 * 1000) {
+      const res = await fetch(SUPABASE_JWKS_URL);
+      if (res.ok) {
+        cachedJwks = (await res.json()) as {
+          keys: Array<crypto.JsonWebKey & { kid?: string; alg?: string }>;
+        };
+        cachedJwksAt = Date.now();
+      }
+    }
+
+    const matchingKey = cachedJwks?.keys?.find((k) => !header.kid || k.kid === header.kid);
+    if (matchingKey) {
+      const pubKey = crypto.createPublicKey({ key: matchingKey, format: 'jwk' });
+      const signingInput = Buffer.from(`${parts[0]}.${parts[1]}`);
+      const sig = Buffer.from(parts[2], 'base64url');
+      const verified =
+        header.alg === 'ES256'
+          ? crypto.verify('sha256', signingInput, { key: pubKey, dsaEncoding: 'ieee-p1363' }, sig)
+          : crypto.verify('RSA-SHA256', signingInput, pubKey, sig);
+      if (verified && payload.sub) {
+        return { sub: payload.sub, email: payload.email };
+      }
+    }
+
+    // Fallback to Supabase Auth user lookup
+    const sb = getSupabaseServer();
+    if (!sb) return null;
+    const { data, error } = await sb.auth.getUser(token);
+    if (error || !data.user) return null;
+    return { sub: data.user.id, email: data.user.email };
   } catch {
     return null;
   }
 }
 
-function toMillis(val: unknown): number {
-  if (val instanceof Timestamp) return val.toMillis();
-  if (typeof val === 'object' && val !== null && 'seconds' in val) {
-    return Number((val as { seconds: number }).seconds) * 1000;
+function isoToMillis(val: unknown): number {
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  if (typeof val === 'string' && val) {
+    const parsed = Date.parse(val);
+    if (!Number.isNaN(parsed)) return parsed;
   }
   return Date.now();
 }
@@ -120,18 +177,35 @@ function buildSystemInstruction(
         : 'Write the entire review in clear, natural, everyday English.';
 
   return [
-    'You help real customers draft a concise, authentic first-person Google review (2 to 4 short sentences, around 25 to 65 words).',
+    'You help real customers draft a concise, authentic first-person Google review based strictly on the details they supplied.',
     sentimentInstruction,
     languageInstruction,
-    'STRICT GROUNDING RULE: Base the review strictly on the business name, rating, and actual notes supplied by the customer.',
-    'If the customer skipped optional notes, write a brief, natural general review matching their star rating without inventing any specific menu items, treatments, staff names, prices, or events.',
-    'Output ONLY the plain review text. Do not include quotation marks, star emojis, titles, hashtags, or explanations.',
-  ].join(' ');
+    'Strict Rules:',
+    '- Output ONLY the review text itself (2 to 4 natural sentences, roughly 140 to 360 characters).',
+    '- Do NOT wrap the review in quotation marks, markdown, titles, star emojis, or hashtags.',
+    '- Do NOT invent dishes, staff names, prices, wait times, or experiences that the customer did not mention.',
+    '- If optional answers are blank, write a concise, honest general impression matching the star rating without fabricating specifics.',
+  ].join('\n');
 }
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
+
+  app.use('/api', (req: Request, res: Response, next) => {
+    const origin = req.headers.origin;
+    if (origin && (origin.startsWith('https://') || origin.startsWith('http://localhost'))) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
 
   app.use(express.json({ limit: '32kb' }));
 
@@ -141,6 +215,7 @@ async function startServer() {
     res.json({
       liveAiConfigured: geminiReady || openRouterReady,
       activeProvider: geminiReady ? 'gemini' : openRouterReady ? 'openrouter' : 'fallback',
+      supabaseConnected: Boolean(SUPABASE_URL),
       appUrl:
         process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL'
           ? process.env.APP_URL.replace(/\/+$/, '')
@@ -148,7 +223,61 @@ async function startServer() {
     });
   });
 
-  // Resilient same-origin fallback for public QR scan resolution (governed by firestore.rules)
+  // Server-assisted Supabase Auth signup (auto-confirms email when SUPABASE_SECRET_KEY is configured)
+  app.post('/api/auth/signup', async (req: Request, res: Response) => {
+    if (!SUPABASE_SECRET_KEY) {
+      res.status(501).json({ created: false });
+      return;
+    }
+    const body = (req.body ?? {}) as SignupBody;
+    const email = (body.email ?? '').trim().toLowerCase();
+    const password = body.password ?? '';
+    const fullName = (body.fullName ?? '').trim().slice(0, 80);
+
+    if (!email || !email.includes('@') || password.length < 6) {
+      res.status(400).json({ created: false, error: 'Valid email and 6+ character password required.' });
+      return;
+    }
+
+    const sbAdmin = getSupabaseServer();
+    if (!sbAdmin) {
+      res.status(503).json({ created: false });
+      return;
+    }
+
+    const { error } = await sbAdmin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: {
+        full_name: fullName || email.split('@')[0],
+      },
+    });
+
+    if (error) {
+      res.status(400).json({ created: false, error: error.message });
+      return;
+    }
+
+    res.json({ created: true });
+  });
+
+  // Authenticated JWT verification health route via SUPABASE_JWKS_URL
+  app.get('/api/auth/me', async (req: Request, res: Response) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ authenticated: false });
+      return;
+    }
+    const verified = await verifySupabaseJwtViaJwks(authHeader.slice(7));
+    if (!verified) {
+      res.status(401).json({ authenticated: false });
+      return;
+    }
+    res.json({ authenticated: true, user: verified });
+  });
+
+  // Same-origin fallback for public QR scan resolution via Supabase
   app.get('/api/public/businesses/:slug', async (req: Request, res: Response) => {
     const slug = String(req.params.slug ?? '')
       .toLowerCase()
@@ -158,34 +287,43 @@ async function startServer() {
       return;
     }
 
-    const db = getServerFirestore();
-    if (!db) {
+    const sb = getSupabaseServer();
+    if (!sb) {
       res.status(503).json({ found: false });
       return;
     }
 
     try {
-      const snap = await getDoc(doc(db, 'businesses', slug));
-      if (!snap.exists()) {
+      const { data, error } = await sb
+        .from('businesses')
+        .select('*')
+        .eq('slug', slug)
+        .eq('is_active', true)
+        .maybeSingle();
+
+      if (error || !data) {
         res.status(404).json({ found: false });
         return;
       }
-      const data = snap.data() as Record<string, unknown>;
+
+      const row = data as Record<string, unknown>;
       res.json({
         found: true,
         business: {
-          name: String(data.name ?? ''),
-          category: String(data.category ?? ''),
-          slug: String(data.slug ?? slug),
-          locationLabel: String(data.locationLabel ?? ''),
-          googleReviewUrl: String(data.googleReviewUrl ?? ''),
-          ownerId: String(data.ownerId ?? ''),
-          isActive: Boolean(data.isActive),
-          planId: data.planId ? String(data.planId) : undefined,
+          name: String(row.name ?? ''),
+          category: String(row.category ?? ''),
+          slug: String(row.slug ?? slug),
+          locationLabel: String(row.location_label ?? ''),
+          googleReviewUrl: String(row.google_review_url ?? ''),
+          ownerId: String(row.owner_id ?? ''),
+          isActive: Boolean(row.is_active),
+          planId: row.plan_id ? String(row.plan_id) : undefined,
           subscriptionEndsAtMs:
-            typeof data.subscriptionEndsAtMs === 'number' ? data.subscriptionEndsAtMs : undefined,
-          createdAtMs: toMillis(data.createdAt),
-          updatedAtMs: toMillis(data.updatedAt),
+            row.subscription_ends_at_ms !== null && row.subscription_ends_at_ms !== undefined
+              ? Number(row.subscription_ends_at_ms)
+              : undefined,
+          createdAtMs: isoToMillis(row.created_at),
+          updatedAtMs: isoToMillis(row.updated_at),
         },
       });
     } catch {
@@ -193,16 +331,16 @@ async function startServer() {
     }
   });
 
-  // Resilient same-origin fallback for anonymous customer QR telemetry (governed by firestore.rules)
+  // Same-origin fallback for anonymous customer QR telemetry via Supabase
   app.post('/api/public/businesses/:slug/sessions', async (req: Request, res: Response) => {
     const slug = String(req.params.slug ?? '')
       .toLowerCase()
       .trim();
     const body = (req.body ?? {}) as SessionFallbackBody;
-    const db = getServerFirestore();
+    const sb = getSupabaseServer();
 
     if (
-      !db ||
+      !sb ||
       !slug ||
       slug === 'demo' ||
       !/^[a-z0-9-]+$/.test(slug) ||
@@ -223,16 +361,20 @@ async function startServer() {
     const sessionId = `${cleanVisitId}_${body.stage}_${suffix}`.slice(0, 96);
 
     try {
-      await setDoc(doc(db, 'businesses', slug, 'sessions', sessionId), {
-        businessSlug: slug,
-        businessOwnerId: String(body.businessOwnerId).slice(0, 128),
-        visitId: cleanVisitId,
+      const { error } = await sb.from('review_sessions').insert({
+        id: sessionId,
+        business_slug: slug,
+        business_owner_id: String(body.businessOwnerId).slice(0, 64),
+        visit_id: cleanVisitId,
         rating: Number(body.rating),
         language: body.language,
-        usedOptionalPrompts: Boolean(body.usedOptionalPrompts),
+        used_optional_prompts: Boolean(body.usedOptionalPrompts),
         stage: body.stage,
-        createdAt: serverTimestamp(),
       });
+      if (error) {
+        res.status(403).json({ ok: false });
+        return;
+      }
       res.json({ ok: true });
     } catch {
       res.status(403).json({ ok: false });
@@ -265,136 +407,107 @@ async function startServer() {
       `Business Name: ${businessName}`,
       `Category: ${category}`,
       locationLabel ? `Location: ${locationLabel}` : null,
-      `Selected Star Rating: ${rating} / 5`,
-      primaryAnswer
-        ? `Customer Note 1: ${primaryAnswer}`
-        : 'Customer Note 1: (Customer skipped this optional question)',
-      secondaryAnswer
-        ? `Customer Note 2: ${secondaryAnswer}`
-        : 'Customer Note 2: (Customer skipped this optional question)',
-      variationSeed > 0
-        ? `Phrasing Variation Request #${variationSeed}: Use a fresh sentence structure and opening different from standard templates.`
-        : null,
-    ]
-      .filter(Boolean)
-      .join('\n');
+      `Customer Star Rating: ${rating} out of 5`,
+      `Target Language: ${language}`,
+      `Primary customer note: ${primaryAnswer || '(Skipped by customer)'}`,
+      `Secondary customer note: ${secondaryAnswer || '(Skipped by customer)'}`,
+      `Draft variation number: ${variationSeed + 1}`,
+    ].filter(Boolean);
 
-    // Primary Live Engine: Server-side Gemini API (@google/genai)
+    const userPrompt = promptLines.join('\n');
+
     const ai = getGeminiClient();
     if (ai) {
       try {
         const response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: promptLines,
+          model: 'gemini-3-flash-preview',
+          contents: userPrompt,
           config: {
             systemInstruction,
-            temperature: variationSeed > 0 ? 0.85 : 0.65,
+            temperature: 0.65,
             thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           },
         });
 
-        const generatedText = response.text?.trim();
-        if (generatedText) {
-          res.json({
-            review: generatedText.replace(/^["'“”]+|["'“”]+$/g, '').trim(),
-            provider: 'gemini',
-          });
+        const text = response.text?.trim().replace(/^["“”]+|["“”]+$/g, '');
+        if (text) {
+          res.json({ review: text, source: 'gemini' });
           return;
         }
       } catch (err) {
-        console.error('Gemini generation error:', err instanceof Error ? err.message : err);
-        if (!isOpenRouterConfigured()) {
-          res.status(502).json({
-            error:
-              err instanceof Error
-                ? err.message
-                : 'Live AI generation encountered a temporary error.',
-          });
-          return;
-        }
+        console.error('Gemini review generation error:', err);
       }
     }
 
-    // Secondary Live Engine: Server-side OpenRouter if configured
     if (isOpenRouterConfigured()) {
+      const apiKey = process.env.OPENROUTER_API_KEY!.trim();
+      const model = process.env.OPENROUTER_MODEL?.trim() || 'openai/gpt-4o-mini';
+
       try {
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY?.trim()}`,
+            Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
             'HTTP-Referer': process.env.APP_URL || 'http://localhost:3000',
             'X-Title': 'ReviewEase AI',
           },
           body: JSON.stringify({
-            model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini',
-            temperature: variationSeed > 0 ? 0.85 : 0.65,
+            model,
+            temperature: 0.65,
             max_tokens: 220,
             messages: [
               { role: 'system', content: systemInstruction },
-              { role: 'user', content: promptLines },
+              { role: 'user', content: userPrompt },
             ],
           }),
         });
 
-        if (!response.ok) {
-          const errorText = await response.text();
-          res.status(502).json({
-            error: 'Upstream OpenRouter request failed.',
-            details: errorText.slice(0, 200),
-          });
-          return;
+        if (response.ok) {
+          const data = (await response.json()) as {
+            choices?: Array<{ message?: { content?: string } }>;
+          };
+          const rawReview = data.choices?.[0]?.message?.content?.trim();
+          if (rawReview) {
+            const cleaned = rawReview.replace(/^["“”]+|["“”]+$/g, '').trim();
+            res.json({ review: cleaned, source: 'openrouter' });
+            return;
+          }
         }
-
-        const data = (await response.json()) as {
-          choices?: Array<{ message?: { content?: string } }>;
-        };
-        const generatedText = data.choices?.[0]?.message?.content?.trim();
-
-        if (generatedText) {
-          res.json({
-            review: generatedText.replace(/^["'“”]+|["'“”]+$/g, '').trim(),
-            provider: 'openrouter',
-          });
-          return;
-        }
-      } catch (error) {
-        res.status(500).json({
-          error:
-            error instanceof Error
-              ? error.message
-              : 'Unexpected server error while generating review.',
-        });
-        return;
+      } catch (err) {
+        console.error('OpenRouter request failed:', err);
       }
     }
 
     res.status(503).json({
       configured: false,
-      message: 'No server AI key configured; falling back to local template mode.',
+      message: 'No live AI provider responded; using deterministic local fallback.',
     });
   });
 
-  if (process.env.NODE_ENV !== 'production') {
+  const distPath = path.join(__dirname, 'dist');
+  const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distPath);
+
+  if (isProd) {
+    app.use(express.static(distPath));
+    app.get('*', (_req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(__dirname, 'dist');
-    if (fs.existsSync(distPath)) {
-      app.use(express.static(distPath));
-      app.get('*', (_req: Request, res: Response) => {
-        res.sendFile(path.join(distPath, 'index.html'));
-      });
-    }
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ReviewEase AI production-ready server listening at http://0.0.0.0:${PORT}`);
+    console.log(`ReviewEase AI server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Failed to start ReviewEase AI server:', err);
+  process.exit(1);
+});

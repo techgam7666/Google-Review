@@ -35,10 +35,14 @@ import {
   isSubscriptionCurrentlyValid,
 } from '../data/subscriptionPlans';
 import {
-  isOfflineOrUnavailableError,
-  isQuotaExceededError,
-  reconnectFirestore,
-} from '../lib/firebase';
+  Database,
+  Mail,
+} from 'lucide-react';
+import {
+  SUPABASE_AUTH_PROVIDERS_URL,
+  SUPABASE_BOOTSTRAP_SQL,
+  SUPABASE_SQL_EDITOR_URL,
+} from '../lib/supabaseSchemaSql';
 import {
   buildGoogleMapsFallbackUrl,
   checkBusinessSlugAvailable,
@@ -47,6 +51,7 @@ import {
   deleteRealBusiness,
   extractOrNormalizeGoogleUrl,
   fetchPlatformBillingConfig,
+  isSupabaseSchemaMissing,
   normalizeMerchantSlug,
   setRealBusinessActiveStatus,
   subscribeBusinessSessions,
@@ -55,6 +60,7 @@ import {
   updateRealBusinessDetails,
   validateGoogleReviewUrl,
   validateMerchantSlug,
+  verifySupabaseSchemaReady,
 } from '../services/firestoreService';
 import type {
   BillingCycle,
@@ -127,15 +133,23 @@ export function MerchantWorkspacePage() {
     authReady,
     isSigningIn,
     authError,
-    isUnauthorizedDomainError,
-    currentHostname,
-    firebaseConsoleAuthSettingsUrl,
+    authNotice,
     isPlatformAdmin,
+    signInWithEmail,
+    signUpWithEmail,
     signInWithGoogle,
     signOutUser,
     clearAuthError,
   } = useAuth();
   const { serverAppUrl, liveAiConfigured, activeAiProvider } = useBusiness();
+
+  // Supabase Auth form state (works on Netlify & custom domains with zero domain errors)
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>(() =>
+    validInitialPlan || claimSlugParam ? 'signup' : 'signin'
+  );
+  const [authFullName, setAuthFullName] = useState<string>('');
+  const [authEmail, setAuthEmail] = useState<string>('');
+  const [authPassword, setAuthPassword] = useState<string>('');
 
   const [activeTab, setActiveTab] = useState<WorkspaceTab>(() => {
     if (tabQueryParam === 'billing' || validInitialPlan) return 'billing';
@@ -148,13 +162,16 @@ export function MerchantWorkspacePage() {
   const [billingConfig, setBillingConfig] =
     useState<PlatformBillingConfigRecord>(DEFAULT_BILLING_CONFIG);
 
-  // Owner's businesses list
+  // Owner's businesses list & Supabase schema readiness state
   const [businesses, setBusinesses] = useState<RealBusinessRecord[]>([]);
   const [loadingBusinesses, setLoadingBusinesses] = useState<boolean>(true);
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
   const [showCreateForm, setShowCreateForm] = useState<boolean>(false);
-  const [firestoreBannerError, setFirestoreBannerError] = useState<string | null>(null);
-  const [copiedDomainHost, setCopiedDomainHost] = useState<boolean>(false);
+  const [dbBannerError, setDbBannerError] = useState<string | null>(null);
+  const [schemaMissing, setSchemaMissing] = useState<boolean>(false);
+  const [checkingSchema, setCheckingSchema] = useState<boolean>(false);
+  const [copiedSchemaSql, setCopiedSchemaSql] = useState<boolean>(false);
+  const [dbReloadNonce, setDbReloadNonce] = useState<number>(0);
 
   // Create new business form state
   const [newName, setNewName] = useState<string>('');
@@ -218,11 +235,18 @@ export function MerchantWorkspacePage() {
     if (!authReady || !user) {
       setSubscription(null);
       setLoadingSubscription(false);
+      setSchemaMissing(false);
       return;
     }
 
     setLoadingSubscription(true);
     reloadBillingConfig();
+
+    void verifySupabaseSchemaReady().then((ready) => {
+      if (!ready) {
+        setSchemaMissing(true);
+      }
+    });
 
     const unsubSub = subscribeMerchantSubscription(
       user.uid,
@@ -230,13 +254,16 @@ export function MerchantWorkspacePage() {
         setSubscription(sub);
         setLoadingSubscription(false);
       },
-      () => {
+      (err) => {
         setLoadingSubscription(false);
+        if (isSupabaseSchemaMissing(err)) {
+          setSchemaMissing(true);
+        }
       }
     );
 
     return () => unsubSub();
-  }, [authReady, user]);
+  }, [authReady, user, dbReloadNonce]);
 
   // Subscribe to signed-in merchant's businesses
   useEffect(() => {
@@ -247,13 +274,14 @@ export function MerchantWorkspacePage() {
     }
 
     setLoadingBusinesses(true);
-    setFirestoreBannerError(null);
+    setDbBannerError(null);
 
     const unsub = subscribeOwnerBusinesses(
       user.uid,
       (records) => {
         setBusinesses(records);
         setLoadingBusinesses(false);
+        setSchemaMissing(false);
 
         if (records.length === 0) {
           setShowCreateForm(true);
@@ -267,22 +295,21 @@ export function MerchantWorkspacePage() {
       },
       (err) => {
         setLoadingBusinesses(false);
-        if (isQuotaExceededError(err)) {
-          setFirestoreBannerError(
-            'Daily free Firestore quota exceeded. Quota resets tomorrow — see Firebase Spark/Enterprise pricing for details.'
-          );
-        } else if (isOfflineOrUnavailableError(err)) {
-          setFirestoreBannerError(
-            'Your browser is currently offline or blocking Cloud Firestore. Check your connection and click Reconnect.'
-          );
+        if (isSupabaseSchemaMissing(err)) {
+          setSchemaMissing(true);
+          setDbBannerError(null);
         } else {
-          setFirestoreBannerError('Unable to load your shops. Please refresh and try again.');
+          setDbBannerError(
+            err instanceof Error && err.message
+              ? err.message
+              : 'Unable to load your shops from Supabase. Please click Retry.'
+          );
         }
       }
     );
 
     return () => unsub();
-  }, [authReady, user]);
+  }, [authReady, user, dbReloadNonce]);
 
   const hasValidSubscription = useMemo(
     () => isPlatformAdmin || isSubscriptionCurrentlyValid(subscription),
@@ -691,11 +718,43 @@ export function MerchantWorkspacePage() {
     }
   };
 
-  const handleCopyHostname = async () => {
-    const res = await copyTextToClipboard(currentHostname);
+  const handleCopySchemaSql = async () => {
+    const res = await copyTextToClipboard(SUPABASE_BOOTSTRAP_SQL);
     if (res.ok) {
-      setCopiedDomainHost(true);
-      setTimeout(() => setCopiedDomainHost(false), 2400);
+      setCopiedSchemaSql(true);
+      setTimeout(() => setCopiedSchemaSql(false), 3000);
+    }
+  };
+
+  const handleVerifySchemaReady = async () => {
+    setCheckingSchema(true);
+    setDbBannerError(null);
+    try {
+      const ready = await verifySupabaseSchemaReady();
+      if (ready) {
+        setSchemaMissing(false);
+        setDbReloadNonce((n) => n + 1);
+      } else {
+        setSchemaMissing(true);
+        setDbBannerError(
+          'Tables not detected yet. Paste the copied SQL into Supabase SQL Editor and click Run first.'
+        );
+      }
+    } finally {
+      setCheckingSchema(false);
+    }
+  };
+
+  const handleEmailAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (authMode === 'signup') {
+      await signUpWithEmail({
+        fullName: authFullName,
+        email: authEmail,
+        password: authPassword,
+      });
+    } else {
+      await signInWithEmail(authEmail, authPassword);
     }
   };
 
@@ -711,15 +770,15 @@ export function MerchantWorkspacePage() {
     );
   }
 
-  // 2. Signed-Out Onboarding State
+  // 2. Signed-Out Onboarding State (Supabase Email/Password + Google OAuth)
   if (!user) {
     const preselectedPlan = validInitialPlan ? getPlanCatalogItem(validInitialPlan) : null;
 
     return (
       <div className="min-h-[calc(100vh-4rem)] bg-slate-50/70 py-10 sm:py-16">
-        <div className="max-w-4xl mx-auto px-4 sm:px-6 space-y-6">
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-10 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-            <div className="lg:col-span-7 space-y-5">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 space-y-6">
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-10 grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-10 items-start">
+            <div className="lg:col-span-6 space-y-5">
               <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-indigo-600">
                 <span>Merchant Subscription Portal</span>
                 <span aria-hidden="true">·</span>
@@ -738,7 +797,7 @@ export function MerchantWorkspacePage() {
               </h1>
 
               <p className="text-sm sm:text-base text-slate-600 leading-relaxed">
-                Sign in with Google to activate your monthly subscription (or 7-day free trial), paste your Google Maps link, and download your printable shop counter QR standee.
+                Create your merchant account or sign in to activate your monthly subscription, paste your Google Maps link, and download your printable shop counter QR standee.
               </p>
 
               <ul className="space-y-2.5 text-sm text-slate-700 pt-1">
@@ -757,81 +816,207 @@ export function MerchantWorkspacePage() {
                 <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-indigo-600 shrink-0 mt-1" />
                   <span>
-                    Print-ready counter standee posters (Classic, Navy &amp; Warm Gold themes)
+                    Print-ready counter standee posters (White, Navy &amp; Gold themes)
                   </span>
                 </li>
               </ul>
 
-              {authError && !isUnauthorizedDomainError && (
-                <div
-                  role="alert"
-                  className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs sm:text-sm text-red-800 flex items-start gap-2.5"
+              <div className="pt-3 border-t border-slate-100 space-y-3 text-xs text-slate-600">
+                <p className="font-semibold text-slate-900">How Shop Subscription Works</p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <p className="font-semibold text-slate-900">01. Choose Plan</p>
+                    <p className="mt-0.5 text-slate-500">
+                      7-day trial or ₹499/mo starter plan.
+                    </p>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-slate-900">02. Add Maps Link</p>
+                    <p className="mt-0.5 text-slate-500">
+                      Paste your Google Maps link or shop name.
+                    </p>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-slate-900">03. Print QR Card</p>
+                    <p className="mt-0.5 text-slate-500">
+                      Place on your counter for instant AI reviews.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="lg:col-span-6 lg:border-l lg:border-slate-200 lg:pl-10 space-y-5">
+              <div
+                role="tablist"
+                aria-label="Merchant authentication mode"
+                className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-xl"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={authMode === 'signin'}
+                  onClick={() => {
+                    clearAuthError();
+                    setAuthMode('signin');
+                  }}
+                  className={`py-2 px-3 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                    authMode === 'signin'
+                      ? 'bg-white text-slate-950 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
                 >
-                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                  <span>{authError}</span>
+                  Sign In
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={authMode === 'signup'}
+                  onClick={() => {
+                    clearAuthError();
+                    setAuthMode('signup');
+                  }}
+                  className={`py-2 px-3 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                    authMode === 'signup'
+                      ? 'bg-white text-slate-950 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Create Shop Account
+                </button>
+              </div>
+
+              {authNotice && (
+                <div
+                  role="status"
+                  className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs sm:text-sm text-emerald-900 flex items-start gap-2.5"
+                >
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span>{authNotice}</span>
                 </div>
               )}
 
-              {/* Actionable Self-Service Guide when deployed to Netlify / Vercel / Custom Domain */}
-              {isUnauthorizedDomainError && (
+              {authError && (
                 <div
                   role="alert"
-                  className="rounded-xl border border-amber-300 bg-amber-50/90 p-4 space-y-3 text-xs sm:text-sm text-amber-950"
+                  className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs sm:text-sm text-red-800 space-y-2"
                 >
                   <div className="flex items-start gap-2.5">
-                    <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-                    <div className="space-y-1">
-                      <p className="font-semibold">
-                        One-time custom domain setup needed for{' '}
-                        <code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">
-                          {currentHostname}
-                        </code>
-                      </p>
-                      <p className="text-xs text-amber-900 leading-relaxed">
-                        Firebase blocks Google Sign-In popups on newly deployed domains (such as Netlify or custom domains) until you add the domain in Firebase Console:
-                      </p>
+                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                    <span>{authError}</span>
+                  </div>
+                  {authError.toLowerCase().includes('authentication') && (
+                    <div className="pl-6">
+                      <a
+                        href={SUPABASE_AUTH_PROVIDERS_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-xs font-semibold text-red-900 underline underline-offset-2"
+                      >
+                        <span>Open Supabase Auth Providers</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
                     </div>
-                  </div>
-
-                  <ol className="list-decimal list-inside space-y-1 text-xs text-amber-900 pl-1">
-                    <li>Click <strong>Copy Domain</strong> below to copy <code className="font-mono">{currentHostname}</code>.</li>
-                    <li>Open <strong>Firebase Auth Settings</strong> → scroll to <strong>Authorized domains</strong> → click <strong>Add domain</strong>.</li>
-                    <li>Paste <code className="font-mono">{currentHostname}</code>, click Add, then click <strong>Continue with Google</strong> again.</li>
-                  </ol>
-
-                  <div className="flex flex-wrap items-center gap-2.5 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyHostname()}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-900 bg-white border border-amber-300 rounded-lg hover:bg-amber-100/50 transition-colors"
-                    >
-                      {copiedDomainHost ? (
-                        <>
-                          <Check className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>Copied {currentHostname}</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="w-3.5 h-3.5" />
-                          <span>Copy Domain ({currentHostname})</span>
-                        </>
-                      )}
-                    </button>
-
-                    <a
-                      href={firebaseConsoleAuthSettingsUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors"
-                    >
-                      <span>Open Firebase Auth Settings</span>
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                  </div>
+                  )}
                 </div>
               )}
 
-              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 pt-2">
+              <form onSubmit={(e) => void handleEmailAuthSubmit(e)} className="space-y-4">
+                {authMode === 'signup' && (
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor="merchant-full-name"
+                      className="block text-xs font-semibold text-slate-700"
+                    >
+                      Owner or Shop Name
+                    </label>
+                    <input
+                      id="merchant-full-name"
+                      type="text"
+                      required
+                      maxLength={80}
+                      value={authFullName}
+                      onChange={(e) => setAuthFullName(e.target.value)}
+                      placeholder="e.g., Beyond The Beauty Clinic"
+                      className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                    />
+                  </div>
+                )}
+
+                <div className="space-y-1.5">
+                  <label
+                    htmlFor="merchant-email"
+                    className="block text-xs font-semibold text-slate-700"
+                  >
+                    Business Email Address
+                  </label>
+                  <input
+                    id="merchant-email"
+                    type="email"
+                    required
+                    autoComplete="email"
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    placeholder="you@yourshop.com"
+                    className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label
+                    htmlFor="merchant-password"
+                    className="block text-xs font-semibold text-slate-700"
+                  >
+                    Password
+                  </label>
+                  <input
+                    id="merchant-password"
+                    type="password"
+                    required
+                    minLength={6}
+                    autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'}
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    placeholder="Minimum 6 characters"
+                    className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSigningIn}
+                  className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+                >
+                  {isSigningIn ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>
+                        {authMode === 'signup' ? 'Creating Account...' : 'Signing In...'}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <Mail className="w-4 h-4" />
+                      <span>
+                        {authMode === 'signup'
+                          ? 'Create Shop Account'
+                          : 'Sign In to Merchant Portal'}
+                      </span>
+                    </>
+                  )}
+                </button>
+              </form>
+
+              <div className="relative py-1">
+                <div className="absolute inset-0 flex items-center" aria-hidden="true">
+                  <div className="w-full border-t border-slate-200" />
+                </div>
+                <div className="relative flex justify-center text-xs">
+                  <span className="bg-white px-2.5 text-slate-400">or</span>
+                </div>
+              </div>
+
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
                 <button
                   type="button"
                   disabled={isSigningIn}
@@ -839,79 +1024,19 @@ export function MerchantWorkspacePage() {
                     clearAuthError();
                     void signInWithGoogle();
                   }}
-                  className="inline-flex items-center justify-center gap-2.5 px-6 py-3 text-sm font-semibold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+                  className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs sm:text-sm font-semibold text-slate-800 bg-white border border-slate-300 rounded-xl hover:bg-slate-50 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
                 >
-                  {isSigningIn ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Signing in...</span>
-                    </>
-                  ) : (
-                    <span>Continue with Google</span>
-                  )}
+                  <span>Continue with Google</span>
                 </button>
 
                 <Link
                   to="/#pricing"
-                  className="inline-flex items-center justify-center px-5 py-3 text-sm font-medium text-slate-700 bg-slate-100 rounded-xl hover:bg-slate-200/80 transition-colors whitespace-nowrap shrink-0"
+                  className="inline-flex items-center justify-center px-4 py-2.5 text-xs sm:text-sm font-medium text-slate-700 bg-slate-100 rounded-xl hover:bg-slate-200/80 transition-colors whitespace-nowrap shrink-0"
                 >
-                  Compare Monthly Plans
+                  Compare Plans
                 </Link>
               </div>
             </div>
-
-            <div className="lg:col-span-5 rounded-xl border border-slate-200 bg-slate-50/80 p-6 space-y-4">
-              <p className="text-xs font-semibold text-slate-800">How Shop Subscription Works</p>
-              <div className="space-y-3.5 text-xs text-slate-600">
-                <div>
-                  <p className="font-semibold text-slate-900">
-                    01. Subscribe Monthly (or 7-Day Free Trial)
-                  </p>
-                  <p className="mt-0.5">
-                    Plans start at ₹499/month for single shops, ₹999/month for up to 5 branches.
-                  </p>
-                </div>
-                <div>
-                  <p className="font-semibold text-slate-900">
-                    02. Paste Your Google Maps Link
-                  </p>
-                  <p className="mt-0.5">
-                    Paste your Google Maps share link or type your shop name &amp; city — we connect it automatically.
-                  </p>
-                </div>
-                <div>
-                  <p className="font-semibold text-slate-900">
-                    03. Place Your Shop Counter QR Standee
-                  </p>
-                  <p className="mt-0.5">
-                    Print your QR standee and place it at reception or billing. Customers scan, AI drafts their review, and they post on Google.
-                  </p>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // 3. Unverified Email Guard
-  if (!user.emailVerified) {
-    return (
-      <div className="min-h-[calc(100vh-4rem)] bg-slate-50/70 py-14">
-        <div className="max-w-lg mx-auto px-4 sm:px-6">
-          <div className="rounded-2xl border border-amber-200 bg-white p-6 space-y-4">
-            <h1 className="text-xl font-bold text-slate-900">Verified Google Email Required</h1>
-            <p className="text-sm text-slate-600 leading-relaxed">
-              Your signed-in account does not have a verified email address. Please sign in with a verified Google account to manage merchant subscriptions and QR scanners.
-            </p>
-            <button
-              type="button"
-              onClick={() => void signOutUser()}
-              className="px-4 py-2 text-sm font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800"
-            >
-              Sign Out &amp; Switch Account
-            </button>
           </div>
         </div>
       </div>
@@ -1080,25 +1205,95 @@ export function MerchantWorkspacePage() {
           </div>
         </div>
 
-        {firestoreBannerError && (
+        {/* 1-Time Supabase Database Table Initialization Card */}
+        {schemaMissing && (
+          <div
+            role="region"
+            aria-label="Initialize Supabase Database Tables"
+            className="rounded-2xl border border-amber-300 bg-amber-50/90 p-5 sm:p-6 space-y-4 text-amber-950"
+          >
+            <div className="flex items-start gap-3">
+              <Database className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <h2 className="text-sm sm:text-base font-bold text-slate-950">
+                  One-time Supabase table setup required (20 seconds)
+                </h2>
+                <p className="text-xs sm:text-sm text-amber-900 leading-relaxed">
+                  Your Supabase project is connected, and now needs its 4 PostgreSQL tables (<code className="font-mono text-xs">subscriptions</code>, <code className="font-mono text-xs">businesses</code>, <code className="font-mono text-xs">review_sessions</code>, <code className="font-mono text-xs">platform_settings</code>) initialized once in the SQL Editor.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5 pt-1">
+              <button
+                type="button"
+                onClick={() => void handleCopySchemaSql()}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-900 bg-white border border-amber-300 rounded-lg hover:bg-amber-100/60 transition-colors whitespace-nowrap shrink-0"
+              >
+                {copiedSchemaSql ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>1. SQL Copied!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>1. Copy SQL Schema</span>
+                  </>
+                )}
+              </button>
+
+              <a
+                href={SUPABASE_SQL_EDITOR_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+              >
+                <span>2. Open Supabase SQL Editor &amp; Click Run</span>
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+
+              <button
+                type="button"
+                disabled={checkingSchema}
+                onClick={() => void handleVerifySchemaReady()}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+              >
+                {checkingSchema ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Checking Tables...</span>
+                  </>
+                ) : (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>3. Verify Tables Connected</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {dbBannerError && (
           <div
             role="alert"
             className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 flex flex-wrap items-center justify-between gap-3"
           >
             <div className="flex items-start gap-2.5">
               <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-              <span>{firestoreBannerError}</span>
+              <span>{dbBannerError}</span>
             </div>
             <button
               type="button"
               onClick={() => {
-                setFirestoreBannerError(null);
-                void reconnectFirestore();
+                setDbBannerError(null);
+                setDbReloadNonce((n) => n + 1);
               }}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-amber-950 bg-white border border-amber-300 rounded-lg hover:bg-amber-100/60 transition-colors whitespace-nowrap shrink-0"
             >
               <RefreshCw className="w-3.5 h-3.5" />
-              <span>Reconnect</span>
+              <span>Retry</span>
             </button>
           </div>
         )}

@@ -1,30 +1,8 @@
 import {
-  collection,
-  deleteDoc,
-  doc,
-  getDoc,
-  getDocs,
-  limit,
-  onSnapshot,
-  query,
-  serverTimestamp,
-  setDoc,
-  Timestamp,
-  updateDoc,
-  where,
-  type Unsubscribe,
-} from 'firebase/firestore';
-import {
   getMaxBusinessesForPlan,
   getPlanPriceInr,
 } from '../data/subscriptionPlans';
-import {
-  auth,
-  db,
-  handleFirestoreError,
-  isOfflineOrUnavailableError,
-  OperationType,
-} from '../lib/firebase';
+import { isMissingSupabaseTableError, supabase } from '../lib/supabase';
 import type {
   BillingCycle,
   MerchantSubscriptionRecord,
@@ -38,7 +16,8 @@ import type {
   SubscriptionStatus,
 } from '../types/review';
 
-// Synchronized verbatim with firebase-blueprint.json & firestore.rules bounds
+export type Unsubscribe = () => void;
+
 export const BUSINESS_MAX_NAME = 80;
 export const BUSINESS_MAX_CATEGORY = 60;
 export const BUSINESS_MIN_SLUG = 2;
@@ -48,6 +27,8 @@ export const BUSINESS_MIN_URL = 10;
 export const BUSINESS_MAX_URL = 500;
 const SLUG_REGEX = /^[a-z0-9-]+$/;
 const URL_REGEX = /^https?:\/\/.+/;
+
+export const SUPABASE_SCHEMA_MISSING_CODE = 'SUPABASE_SCHEMA_MISSING';
 
 export const DEFAULT_BILLING_CONFIG: PlatformBillingConfigRecord = {
   upiId: '',
@@ -60,6 +41,28 @@ export const DEFAULT_BILLING_CONFIG: PlatformBillingConfigRecord = {
   updatedByUid: '',
   updatedAtMs: 0,
 };
+
+function makeSchemaMissingError(): Error {
+  const err = new Error(
+    'Supabase database tables have not been initialized yet. Run the 1-click SQL setup above in your Supabase SQL Editor.'
+  );
+  (err as Error & { code?: string }).code = SUPABASE_SCHEMA_MISSING_CODE;
+  return err;
+}
+
+export function isSupabaseSchemaMissing(error: unknown): boolean {
+  if (!error) return false;
+  if ((error as { code?: string })?.code === SUPABASE_SCHEMA_MISSING_CODE) return true;
+  return isMissingSupabaseTableError(error);
+}
+
+export async function verifySupabaseSchemaReady(): Promise<boolean> {
+  const { error } = await supabase.from('businesses').select('slug').limit(1);
+  if (error && isMissingSupabaseTableError(error)) {
+    return false;
+  }
+  return !error;
+}
 
 export function normalizeMerchantSlug(raw: string): string {
   const cleaned = raw
@@ -75,7 +78,7 @@ export function normalizeMerchantSlug(raw: string): string {
 
 export function validateMerchantSlug(slug: string): string | null {
   if (slug === 'demo') {
-    return 'The slug "demo" is reserved for the public walkthrough. Choose your shop name instead.';
+    return 'The slug "demo" is reserved. Choose your shop name instead.';
   }
   if (slug.length < BUSINESS_MIN_SLUG || slug.length > BUSINESS_MAX_SLUG) {
     return `URL slug must be between ${BUSINESS_MIN_SLUG} and ${BUSINESS_MAX_SLUG} characters.`;
@@ -86,22 +89,15 @@ export function validateMerchantSlug(slug: string): string | null {
   return null;
 }
 
-/**
- * Smart Google Maps / Share URL Extractor:
- * Handles pasted Android/WhatsApp Google Maps share strings ("Shop Name https://maps.app.goo.gl/..."),
- * bare domains ("maps.app.goo.gl/...", "g.page/..."), or builds a direct Google Maps search link.
- */
 export function extractOrNormalizeGoogleUrl(rawInput: string): string {
   const trimmed = rawInput.trim();
   if (!trimmed) return '';
 
-  // 1. If pasted text contains an embedded https:// or http:// link (e.g. from Google Maps Share button), extract it
   const embeddedMatch = trimmed.match(/https?:\/\/[^\s"'<>]+/i);
   if (embeddedMatch && embeddedMatch[0]) {
     return embeddedMatch[0].replace(/[.,;)]+$/, '').slice(0, BUSINESS_MAX_URL);
   }
 
-  // 2. If user pasted a bare domain without protocol (e.g. maps.app.goo.gl/xyz or google.com/maps/...)
   if (
     /^(maps\.app\.goo\.gl|goo\.gl\/maps|g\.page|g\.co|(www\.)?google\.[a-z.]+\/maps|search\.google\.com)/i.test(
       trimmed
@@ -110,7 +106,6 @@ export function extractOrNormalizeGoogleUrl(rawInput: string): string {
     return `https://${trimmed}`.slice(0, BUSINESS_MAX_URL);
   }
 
-  // 3. Generic domain-like input without spaces
   if (!trimmed.includes(' ') && /^[a-z0-9.-]+\.[a-z]{2,}\/.+/i.test(trimmed)) {
     return `https://${trimmed}`.slice(0, BUSINESS_MAX_URL);
   }
@@ -145,55 +140,70 @@ export function validateGoogleReviewUrl(url: string): string | null {
   }
 }
 
-function toMillis(val: unknown): number {
-  if (val instanceof Timestamp) {
-    return val.toMillis();
-  }
-  if (typeof val === 'object' && val !== null && 'seconds' in val) {
-    return Number((val as { seconds: number }).seconds) * 1000;
-  }
-  if (typeof val === 'number' && Number.isFinite(val)) {
-    return val;
+function isoToMillis(val: unknown): number {
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  if (typeof val === 'string' && val) {
+    const parsed = Date.parse(val);
+    if (!Number.isNaN(parsed)) return parsed;
   }
   return Date.now();
 }
 
-function mapDocToBusiness(data: Record<string, unknown>): RealBusinessRecord {
+function mapRowToBusiness(row: Record<string, unknown>): RealBusinessRecord {
   return {
-    name: String(data.name ?? ''),
-    category: String(data.category ?? ''),
-    slug: String(data.slug ?? ''),
-    locationLabel: String(data.locationLabel ?? ''),
-    googleReviewUrl: String(data.googleReviewUrl ?? ''),
-    ownerId: String(data.ownerId ?? ''),
-    isActive: Boolean(data.isActive),
-    planId: data.planId ? (String(data.planId) as SubscriptionPlanId) : undefined,
+    name: String(row.name ?? ''),
+    category: String(row.category ?? ''),
+    slug: String(row.slug ?? ''),
+    locationLabel: String(row.location_label ?? ''),
+    googleReviewUrl: String(row.google_review_url ?? ''),
+    ownerId: String(row.owner_id ?? ''),
+    isActive: Boolean(row.is_active),
+    planId: row.plan_id ? (String(row.plan_id) as SubscriptionPlanId) : undefined,
     subscriptionEndsAtMs:
-      typeof data.subscriptionEndsAtMs === 'number' ? data.subscriptionEndsAtMs : undefined,
-    createdAtMs: toMillis(data.createdAt),
-    updatedAtMs: toMillis(data.updatedAt),
+      row.subscription_ends_at_ms !== null && row.subscription_ends_at_ms !== undefined
+        ? Number(row.subscription_ends_at_ms)
+        : undefined,
+    createdAtMs: isoToMillis(row.created_at),
+    updatedAtMs: isoToMillis(row.updated_at),
   };
 }
 
-function mapDocToSubscription(data: Record<string, unknown>): MerchantSubscriptionRecord {
-  const planId = (data.planId as SubscriptionPlanId) ?? 'starter';
+function mapRowToSubscription(row: Record<string, unknown>): MerchantSubscriptionRecord {
+  const planId = (row.plan_id as SubscriptionPlanId) ?? 'starter';
   return {
-    userId: String(data.userId ?? ''),
-    accountLabel: String(data.accountLabel ?? 'Merchant Account'),
+    userId: String(row.user_id ?? ''),
+    accountLabel: String(row.account_label ?? 'Merchant Account'),
     planId,
-    billingCycle: (data.billingCycle as BillingCycle) ?? 'monthly',
-    status: (data.status as SubscriptionStatus) ?? 'active',
-    maxBusinesses: Number(data.maxBusinesses ?? getMaxBusinessesForPlan(planId)),
-    priceInr: Number(data.priceInr ?? 0),
-    paymentReference: String(data.paymentReference ?? ''),
-    currentPeriodEndMs: Number(data.currentPeriodEndMs ?? Date.now()),
-    createdAtMs: toMillis(data.createdAt),
-    updatedAtMs: toMillis(data.updatedAt),
+    billingCycle: (row.billing_cycle as BillingCycle) ?? 'monthly',
+    status: (row.status as SubscriptionStatus) ?? 'active',
+    maxBusinesses: Number(row.max_businesses ?? getMaxBusinessesForPlan(planId)),
+    priceInr: Number(row.price_inr ?? 0),
+    paymentReference: String(row.payment_reference ?? ''),
+    currentPeriodEndMs: Number(row.current_period_end_ms ?? Date.now()),
+    createdAtMs: isoToMillis(row.created_at),
+    updatedAtMs: isoToMillis(row.updated_at),
+  };
+}
+
+async function requireAuthenticatedUser(): Promise<{ id: string; email: string | null; name: string | null }> {
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data.user) {
+    throw new Error('Please sign in to your merchant account first.');
+  }
+  const meta = (data.user.user_metadata ?? {}) as Record<string, unknown>;
+  const name =
+    (typeof meta.full_name === 'string' && meta.full_name.trim()) ||
+    (typeof meta.name === 'string' && meta.name.trim()) ||
+    null;
+  return {
+    id: data.user.id,
+    email: data.user.email ?? null,
+    name,
   };
 }
 
 // ============================================================================
-// SaaS Subscription & Billing Config Services
+// SaaS Subscription & Billing Config Services (Supabase PostgreSQL)
 // ============================================================================
 
 export function subscribeMerchantSubscription(
@@ -201,27 +211,50 @@ export function subscribeMerchantSubscription(
   onSubscription: (sub: MerchantSubscriptionRecord | null) => void,
   onErrorCallback?: (err: Error) => void
 ): Unsubscribe {
-  const path = `subscriptions/${userId}`;
-  return onSnapshot(
-    doc(db, 'subscriptions', userId),
-    (snap) => {
-      if (!snap.exists()) {
-        onSubscription(null);
+  let cancelled = false;
+
+  const fetchSub = async () => {
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (cancelled) return;
+    if (error) {
+      if (isMissingSupabaseTableError(error)) {
+        onErrorCallback?.(makeSchemaMissingError());
         return;
       }
-      onSubscription(mapDocToSubscription(snap.data() as Record<string, unknown>));
-    },
-    (error) => {
-      if (onErrorCallback) {
-        onErrorCallback(error instanceof Error ? error : new Error(String(error)));
-      }
-      try {
-        handleFirestoreError(error, OperationType.GET, path);
-      } catch {
-        // Structured diagnostic logged
-      }
+      onErrorCallback?.(new Error(error.message));
+      return;
     }
-  );
+
+    onSubscription(data ? mapRowToSubscription(data as Record<string, unknown>) : null);
+  };
+
+  void fetchSub();
+
+  const channel = supabase
+    .channel(`sub_${userId}_${Math.random().toString(36).slice(2, 7)}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'subscriptions',
+        filter: `user_id=eq.${userId}`,
+      },
+      () => {
+        void fetchSub();
+      }
+    )
+    .subscribe();
+
+  return () => {
+    cancelled = true;
+    void supabase.removeChannel(channel);
+  };
 }
 
 export async function activateOrUpdateMerchantSubscription(params: {
@@ -231,16 +264,13 @@ export async function activateOrUpdateMerchantSubscription(params: {
   paymentReference: string;
   trialDays?: number;
 }): Promise<MerchantSubscriptionRecord> {
-  const currentUser = auth.currentUser;
-  if (!currentUser) {
-    throw new Error('Please sign in with Google first.');
-  }
+  const currentUser = await requireAuthenticatedUser();
+  const userId = currentUser.id;
 
-  const userId = currentUser.uid;
-  const path = `subscriptions/${userId}`;
   const cleanAccountLabel = (
     params.accountLabel.trim() ||
-    currentUser.displayName ||
+    currentUser.name ||
+    currentUser.email?.split('@')[0] ||
     'Merchant Shop'
   ).slice(0, 80);
 
@@ -257,112 +287,74 @@ export async function activateOrUpdateMerchantSubscription(params: {
       ? 365
       : 30;
   const currentPeriodEndMs = Date.now() + durationDays * 24 * 60 * 60 * 1000;
-  const cleanRef = (isTrial ? 'FREE_TRIAL' : params.paymentReference.trim() || 'SELF_ACTIVATED').slice(
-    0,
-    80
-  );
+  const cleanRef = (
+    isTrial ? 'FREE_TRIAL' : params.paymentReference.trim() || 'SELF_ACTIVATED'
+  ).slice(0, 80);
 
-  try {
-    const existingSnap = await getDoc(doc(db, 'subscriptions', userId));
-    if (!existingSnap.exists()) {
-      await setDoc(doc(db, 'subscriptions', userId), {
-        userId,
-        accountLabel: cleanAccountLabel,
-        planId: params.planId,
-        billingCycle: params.billingCycle,
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .upsert(
+      {
+        user_id: userId,
+        account_label: cleanAccountLabel,
+        plan_id: params.planId,
+        billing_cycle: params.billingCycle,
         status,
-        maxBusinesses,
-        priceInr,
-        paymentReference: cleanRef,
-        currentPeriodEndMs,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      await updateDoc(doc(db, 'subscriptions', userId), {
-        accountLabel: cleanAccountLabel,
-        planId: params.planId,
-        billingCycle: params.billingCycle,
-        status,
-        maxBusinesses,
-        priceInr,
-        paymentReference: cleanRef,
-        currentPeriodEndMs,
-        updatedAt: serverTimestamp(),
-      });
-    }
+        max_businesses: maxBusinesses,
+        price_inr: priceInr,
+        payment_reference: cleanRef,
+        current_period_end_ms: currentPeriodEndMs,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'user_id' }
+    )
+    .select('*')
+    .single();
 
-    // Sync updated subscription expiry onto all shops owned by this merchant
-    try {
-      const bizSnap = await getDocs(
-        query(collection(db, 'businesses'), where('ownerId', '==', userId))
-      );
-      await Promise.all(
-        bizSnap.docs.map((bizDoc) =>
-          updateDoc(doc(db, 'businesses', bizDoc.id), {
-            planId: params.planId,
-            subscriptionEndsAtMs: currentPeriodEndMs,
-            isActive: true,
-            updatedAt: serverTimestamp(),
-          })
-        )
-      );
-    } catch {
-      // Non-fatal if merchant has zero shops yet
+  if (error) {
+    if (isMissingSupabaseTableError(error)) {
+      throw makeSchemaMissingError();
     }
-
-    return {
-      userId,
-      accountLabel: cleanAccountLabel,
-      planId: params.planId,
-      billingCycle: params.billingCycle,
-      status,
-      maxBusinesses,
-      priceInr,
-      paymentReference: cleanRef,
-      currentPeriodEndMs,
-      createdAtMs: Date.now(),
-      updatedAtMs: Date.now(),
-    };
-  } catch (error) {
-    if (isOfflineOrUnavailableError(error)) {
-      throw new Error(
-        'Cannot reach Cloud Firestore right now. Check your connection and try again.'
-      );
-    }
-    handleFirestoreError(error, OperationType.WRITE, path);
+    throw new Error(error.message);
   }
+
+  // Sync updated subscription expiry onto all shops owned by this merchant
+  await supabase
+    .from('businesses')
+    .update({
+      plan_id: params.planId,
+      subscription_ends_at_ms: currentPeriodEndMs,
+      is_active: true,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('owner_id', userId);
+
+  return mapRowToSubscription(data as Record<string, unknown>);
 }
 
 export async function fetchPlatformBillingConfig(): Promise<PlatformBillingConfigRecord> {
-  const path = 'platformSettings/billing';
-  try {
-    const snap = await getDoc(doc(db, 'platformSettings', 'billing'));
-    if (!snap.exists()) {
-      return DEFAULT_BILLING_CONFIG;
-    }
-    const data = snap.data() as Record<string, unknown>;
-    return {
-      upiId: String(data.upiId ?? ''),
-      payeeName: String(data.payeeName ?? 'ReviewEase AI'),
-      paymentLinkStarter: String(data.paymentLinkStarter ?? ''),
-      paymentLinkGrowth: String(data.paymentLinkGrowth ?? ''),
-      paymentLinkAgency: String(data.paymentLinkAgency ?? ''),
-      supportContact: String(data.supportContact ?? ''),
-      trialDays: Number(data.trialDays ?? 7),
-      updatedByUid: String(data.updatedByUid ?? ''),
-      updatedAtMs: toMillis(data.updatedAt),
-    };
-  } catch (error) {
-    if (isOfflineOrUnavailableError(error)) {
-      return DEFAULT_BILLING_CONFIG;
-    }
-    const msg = error instanceof Error ? error.message : String(error);
-    if (msg.toLowerCase().includes('permission')) {
-      return DEFAULT_BILLING_CONFIG;
-    }
-    handleFirestoreError(error, OperationType.GET, path);
+  const { data, error } = await supabase
+    .from('platform_settings')
+    .select('*')
+    .eq('id', 'billing')
+    .maybeSingle();
+
+  if (error || !data) {
+    return DEFAULT_BILLING_CONFIG;
   }
+
+  const row = data as Record<string, unknown>;
+  return {
+    upiId: String(row.upi_id ?? ''),
+    payeeName: String(row.payee_name ?? 'ReviewEase AI'),
+    paymentLinkStarter: String(row.payment_link_starter ?? ''),
+    paymentLinkGrowth: String(row.payment_link_growth ?? ''),
+    paymentLinkAgency: String(row.payment_link_agency ?? ''),
+    supportContact: String(row.support_contact ?? ''),
+    trialDays: Number(row.trial_days ?? 7),
+    updatedByUid: String(row.updated_by_uid ?? ''),
+    updatedAtMs: isoToMillis(row.updated_at),
+  };
 }
 
 export async function savePlatformBillingConfig(input: {
@@ -374,10 +366,7 @@ export async function savePlatformBillingConfig(input: {
   supportContact: string;
   trialDays: number;
 }): Promise<void> {
-  const currentUser = auth.currentUser;
-  if (!currentUser) {
-    throw new Error('Admin authentication required.');
-  }
+  const currentUser = await requireAuthenticatedUser();
 
   const cleanOptionalUrl = (raw: string) => {
     const t = raw.trim().slice(0, 300);
@@ -388,90 +377,118 @@ export async function savePlatformBillingConfig(input: {
     return t;
   };
 
-  const payload = {
-    upiId: input.upiId.trim().slice(0, 80),
-    payeeName: (input.payeeName.trim() || 'ReviewEase AI').slice(0, 80),
-    paymentLinkStarter: cleanOptionalUrl(input.paymentLinkStarter),
-    paymentLinkGrowth: cleanOptionalUrl(input.paymentLinkGrowth),
-    paymentLinkAgency: cleanOptionalUrl(input.paymentLinkAgency),
-    supportContact: input.supportContact.trim().slice(0, 80),
-    trialDays: Math.max(0, Math.min(30, Math.round(input.trialDays))),
-    updatedByUid: currentUser.uid,
-    updatedAt: serverTimestamp(),
-  };
+  const { error } = await supabase.from('platform_settings').upsert(
+    {
+      id: 'billing',
+      upi_id: input.upiId.trim().slice(0, 80),
+      payee_name: (input.payeeName.trim() || 'ReviewEase AI').slice(0, 80),
+      payment_link_starter: cleanOptionalUrl(input.paymentLinkStarter),
+      payment_link_growth: cleanOptionalUrl(input.paymentLinkGrowth),
+      payment_link_agency: cleanOptionalUrl(input.paymentLinkAgency),
+      support_contact: input.supportContact.trim().slice(0, 80),
+      trial_days: Math.max(0, Math.min(30, Math.round(input.trialDays))),
+      updated_by_uid: currentUser.id,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'id' }
+  );
 
-  const path = 'platformSettings/billing';
-  try {
-    const snap = await getDoc(doc(db, 'platformSettings', 'billing'));
-    if (!snap.exists()) {
-      await setDoc(doc(db, 'platformSettings', 'billing'), payload);
-    } else {
-      await updateDoc(doc(db, 'platformSettings', 'billing'), payload);
+  if (error) {
+    if (isMissingSupabaseTableError(error)) {
+      throw makeSchemaMissingError();
     }
-  } catch (error) {
-    if (isOfflineOrUnavailableError(error)) {
-      throw new Error('Network unavailable. Billing settings could not be saved.');
-    }
-    handleFirestoreError(error, OperationType.WRITE, path);
+    throw new Error(error.message);
   }
 }
 
 // ============================================================================
-// Founder Admin Console Services (Restricted by firestore.rules to isAdmin())
+// Founder Admin Console Services (Governed by Supabase RLS is_founder_admin())
 // ============================================================================
 
 export function subscribeAllPlatformSubscriptions(
   onList: (items: MerchantSubscriptionRecord[]) => void,
   onErrorCallback?: (err: Error) => void
 ): Unsubscribe {
-  const path = 'subscriptions';
-  const q = query(collection(db, 'subscriptions'), limit(200));
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const items = snapshot.docs
-        .map((d) => mapDocToSubscription(d.data() as Record<string, unknown>))
-        .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-      onList(items);
-    },
-    (error) => {
-      if (onErrorCallback) {
-        onErrorCallback(error instanceof Error ? error : new Error(String(error)));
+  let cancelled = false;
+
+  const fetchAll = async () => {
+    const { data, error } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .limit(200);
+
+    if (cancelled) return;
+    if (error) {
+      if (isMissingSupabaseTableError(error)) {
+        onErrorCallback?.(makeSchemaMissingError());
+        return;
       }
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        // Logged structured error
-      }
+      onErrorCallback?.(new Error(error.message));
+      return;
     }
-  );
+
+    onList((data ?? []).map((r) => mapRowToSubscription(r as Record<string, unknown>)));
+  };
+
+  void fetchAll();
+
+  const channel = supabase
+    .channel(`admin_subs_${Math.random().toString(36).slice(2, 7)}`)
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'subscriptions' },
+      () => {
+        void fetchAll();
+      }
+    )
+    .subscribe();
+
+  return () => {
+    cancelled = true;
+    void supabase.removeChannel(channel);
+  };
 }
 
 export function subscribeAllPlatformBusinesses(
   onList: (items: RealBusinessRecord[]) => void,
   onErrorCallback?: (err: Error) => void
 ): Unsubscribe {
-  const path = 'businesses';
-  const q = query(collection(db, 'businesses'), limit(200));
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const items = snapshot.docs
-        .map((d) => mapDocToBusiness(d.data() as Record<string, unknown>))
-        .sort((a, b) => b.createdAtMs - a.createdAtMs);
-      onList(items);
-    },
-    (error) => {
-      if (onErrorCallback) {
-        onErrorCallback(error instanceof Error ? error : new Error(String(error)));
+  let cancelled = false;
+
+  const fetchAll = async () => {
+    const { data, error } = await supabase
+      .from('businesses')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (cancelled) return;
+    if (error) {
+      if (isMissingSupabaseTableError(error)) {
+        onErrorCallback?.(makeSchemaMissingError());
+        return;
       }
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        // Logged structured error
-      }
+      onErrorCallback?.(new Error(error.message));
+      return;
     }
-  );
+
+    onList((data ?? []).map((r) => mapRowToBusiness(r as Record<string, unknown>)));
+  };
+
+  void fetchAll();
+
+  const channel = supabase
+    .channel(`admin_biz_${Math.random().toString(36).slice(2, 7)}`)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'businesses' }, () => {
+      void fetchAll();
+    })
+    .subscribe();
+
+  return () => {
+    cancelled = true;
+    void supabase.removeChannel(channel);
+  };
 }
 
 export async function adminUpdateMerchantSubscription(
@@ -489,42 +506,35 @@ export async function adminUpdateMerchantSubscription(
     ? baseMs + updates.addDays * 24 * 60 * 60 * 1000
     : targetSub.currentPeriodEndMs;
 
-  const path = `subscriptions/${targetSub.userId}`;
-  try {
-    await updateDoc(doc(db, 'subscriptions', targetSub.userId), {
-      accountLabel: targetSub.accountLabel,
-      planId: nextPlan,
-      billingCycle: targetSub.billingCycle,
+  const { error } = await supabase
+    .from('subscriptions')
+    .update({
+      plan_id: nextPlan,
       status: nextStatus,
-      maxBusinesses: getMaxBusinessesForPlan(nextPlan),
-      priceInr: targetSub.priceInr,
-      paymentReference: targetSub.paymentReference,
-      currentPeriodEndMs: nextEndMs,
-      updatedAt: serverTimestamp(),
-    });
+      max_businesses: getMaxBusinessesForPlan(nextPlan),
+      current_period_end_ms: nextEndMs,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('user_id', targetSub.userId);
 
-    // Sync status & expiry onto the merchant's shop QR pages
-    const shouldBeActive = nextStatus === 'active' || nextStatus === 'trialing';
-    const bizSnap = await getDocs(
-      query(collection(db, 'businesses'), where('ownerId', '==', targetSub.userId))
-    );
-    await Promise.all(
-      bizSnap.docs.map((b) =>
-        updateDoc(doc(db, 'businesses', b.id), {
-          planId: nextPlan,
-          subscriptionEndsAtMs: nextEndMs,
-          isActive: shouldBeActive,
-          updatedAt: serverTimestamp(),
-        })
-      )
-    );
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
+  if (error) {
+    throw new Error(error.message);
   }
+
+  const shouldBeActive = nextStatus === 'active' || nextStatus === 'trialing';
+  await supabase
+    .from('businesses')
+    .update({
+      plan_id: nextPlan,
+      subscription_ends_at_ms: nextEndMs,
+      is_active: shouldBeActive,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('owner_id', targetSub.userId);
 }
 
 // ============================================================================
-// Shop / Business Profile & QR Scanner Services
+// Shop / Business Profile & QR Scanner Services (Supabase PostgreSQL)
 // ============================================================================
 
 export async function checkBusinessSlugAvailable(slug: string): Promise<boolean> {
@@ -532,25 +542,20 @@ export async function checkBusinessSlugAvailable(slug: string): Promise<boolean>
   const slugErr = validateMerchantSlug(normalized);
   if (slugErr) return false;
 
-  const path = `businesses/${normalized}`;
-  try {
-    const snap = await getDoc(doc(db, 'businesses', normalized));
-    return !snap.exists();
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (msg.toLowerCase().includes('permission')) {
-      return false;
+  const { data, error } = await supabase
+    .from('businesses')
+    .select('slug')
+    .eq('slug', normalized)
+    .maybeSingle();
+
+  if (error) {
+    if (isMissingSupabaseTableError(error)) {
+      return true;
     }
-    if (isOfflineOrUnavailableError(error)) {
-      try {
-        const res = await fetch(`/api/public/businesses/${encodeURIComponent(normalized)}`);
-        return res.status === 404;
-      } catch {
-        return true;
-      }
-    }
-    handleFirestoreError(error, OperationType.GET, path);
+    return false;
   }
+
+  return !data;
 }
 
 export async function fetchPublicBusinessBySlug(slug: string): Promise<RealBusinessRecord | null> {
@@ -559,33 +564,28 @@ export async function fetchPublicBusinessBySlug(slug: string): Promise<RealBusin
     return null;
   }
 
-  const path = `businesses/${normalized}`;
+  const { data, error } = await supabase
+    .from('businesses')
+    .select('*')
+    .eq('slug', normalized)
+    .maybeSingle();
+
+  if (!error && data) {
+    return mapRowToBusiness(data as Record<string, unknown>);
+  }
+
+  // Optional same-origin API fallback if customer's network blocks supabase.co
   try {
-    const snap = await getDoc(doc(db, 'businesses', normalized));
-    if (!snap.exists()) {
-      return null;
-    }
-    return mapDocToBusiness(snap.data() as Record<string, unknown>);
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (msg.toLowerCase().includes('permission')) {
-      return null;
-    }
-    if (isOfflineOrUnavailableError(error)) {
-      try {
-        const res = await fetch(`/api/public/businesses/${encodeURIComponent(normalized)}`);
-        const contentType = res.headers.get('content-type') ?? '';
-        if (!res.ok || !contentType.includes('application/json')) return null;
-        const json = (await res.json()) as {
-          found?: boolean;
-          business?: RealBusinessRecord;
-        };
-        return json.found && json.business ? json.business : null;
-      } catch {
-        return null;
-      }
-    }
-    handleFirestoreError(error, OperationType.GET, path);
+    const res = await fetch(`/api/public/businesses/${encodeURIComponent(normalized)}`);
+    const contentType = res.headers.get('content-type') ?? '';
+    if (!res.ok || !contentType.includes('application/json')) return null;
+    const json = (await res.json()) as {
+      found?: boolean;
+      business?: RealBusinessRecord;
+    };
+    return json.found && json.business ? json.business : null;
+  } catch {
+    return null;
   }
 }
 
@@ -597,10 +597,7 @@ export async function createRealBusiness(params: {
   googleReviewUrl: string;
   subscription?: MerchantSubscriptionRecord | null;
 }): Promise<RealBusinessRecord> {
-  const currentUser = auth.currentUser;
-  if (!currentUser) {
-    throw new Error('You must sign in with Google before creating a shop QR scanner.');
-  }
+  const currentUser = await requireAuthenticatedUser();
 
   const slug = normalizeMerchantSlug(params.slug);
   const slugError = validateMerchantSlug(slug);
@@ -632,44 +629,35 @@ export async function createRealBusiness(params: {
   const subscriptionEndsAtMs =
     params.subscription?.currentPeriodEndMs ?? Date.now() + 30 * 24 * 60 * 60 * 1000;
 
-  const path = `businesses/${slug}`;
-  const payload = {
-    name,
-    category,
-    slug,
-    locationLabel,
-    googleReviewUrl,
-    ownerId: currentUser.uid,
-    isActive: true,
-    planId,
-    subscriptionEndsAtMs,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  };
-
-  try {
-    await setDoc(doc(db, 'businesses', slug), payload);
-    return {
+  const { data, error } = await supabase
+    .from('businesses')
+    .insert({
+      slug,
       name,
       category,
-      slug,
-      locationLabel,
-      googleReviewUrl,
-      ownerId: currentUser.uid,
-      isActive: true,
-      planId,
-      subscriptionEndsAtMs,
-      createdAtMs: Date.now(),
-      updatedAtMs: Date.now(),
-    };
-  } catch (error) {
-    if (isOfflineOrUnavailableError(error)) {
+      location_label: locationLabel,
+      google_review_url: googleReviewUrl,
+      owner_id: currentUser.id,
+      is_active: true,
+      plan_id: planId,
+      subscription_ends_at_ms: subscriptionEndsAtMs,
+    })
+    .select('*')
+    .single();
+
+  if (error) {
+    if (isMissingSupabaseTableError(error)) {
+      throw makeSchemaMissingError();
+    }
+    if (error.code === '23505') {
       throw new Error(
-        'Cannot reach Cloud Firestore from your browser right now. Check your connection and try again.'
+        `The URL "/review/${slug}" is already claimed. Try adding your area or city name.`
       );
     }
-    handleFirestoreError(error, OperationType.CREATE, path);
+    throw new Error(error.message);
   }
+
+  return mapRowToBusiness(data as Record<string, unknown>);
 }
 
 export async function updateRealBusinessDetails(
@@ -696,55 +684,53 @@ export async function updateRealBusinessDetails(
     throw new Error(urlError);
   }
 
-  const path = `businesses/${slug}`;
   const payload: Record<string, unknown> = {
     name,
     category,
-    locationLabel,
-    googleReviewUrl,
-    updatedAt: serverTimestamp(),
+    location_label: locationLabel,
+    google_review_url: googleReviewUrl,
+    updated_at: new Date().toISOString(),
   };
   if (updates.planId) {
-    payload.planId = updates.planId;
+    payload.plan_id = updates.planId;
   }
   if (typeof updates.subscriptionEndsAtMs === 'number') {
-    payload.subscriptionEndsAtMs = updates.subscriptionEndsAtMs;
+    payload.subscription_ends_at_ms = updates.subscriptionEndsAtMs;
   }
 
-  try {
-    await updateDoc(doc(db, 'businesses', slug), payload);
-  } catch (error) {
-    if (isOfflineOrUnavailableError(error)) {
-      throw new Error('Network unavailable. Changes could not be synced to Cloud Firestore.');
+  const { error } = await supabase.from('businesses').update(payload).eq('slug', slug);
+  if (error) {
+    if (isMissingSupabaseTableError(error)) {
+      throw makeSchemaMissingError();
     }
-    handleFirestoreError(error, OperationType.UPDATE, path);
+    throw new Error(error.message);
   }
 }
 
 export async function setRealBusinessActiveStatus(slug: string, isActive: boolean): Promise<void> {
-  const path = `businesses/${slug}`;
-  try {
-    await updateDoc(doc(db, 'businesses', slug), {
-      isActive,
-      updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    if (isOfflineOrUnavailableError(error)) {
-      throw new Error('Network unavailable. Status could not be updated.');
+  const { error } = await supabase
+    .from('businesses')
+    .update({
+      is_active: isActive,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('slug', slug);
+
+  if (error) {
+    if (isMissingSupabaseTableError(error)) {
+      throw makeSchemaMissingError();
     }
-    handleFirestoreError(error, OperationType.UPDATE, path);
+    throw new Error(error.message);
   }
 }
 
 export async function deleteRealBusiness(slug: string): Promise<void> {
-  const path = `businesses/${slug}`;
-  try {
-    await deleteDoc(doc(db, 'businesses', slug));
-  } catch (error) {
-    if (isOfflineOrUnavailableError(error)) {
-      throw new Error('Network unavailable. Could not delete shop.');
+  const { error } = await supabase.from('businesses').delete().eq('slug', slug);
+  if (error) {
+    if (isMissingSupabaseTableError(error)) {
+      throw makeSchemaMissingError();
     }
-    handleFirestoreError(error, OperationType.DELETE, path);
+    throw new Error(error.message);
   }
 }
 
@@ -753,28 +739,50 @@ export function subscribeOwnerBusinesses(
   onBusinesses: (items: RealBusinessRecord[]) => void,
   onErrorCallback?: (err: Error) => void
 ): Unsubscribe {
-  const path = 'businesses';
-  const q = query(collection(db, 'businesses'), where('ownerId', '==', ownerUid));
+  let cancelled = false;
 
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const records = snapshot.docs
-        .map((d) => mapDocToBusiness(d.data() as Record<string, unknown>))
-        .sort((a, b) => b.createdAtMs - a.createdAtMs);
-      onBusinesses(records);
-    },
-    (error) => {
-      if (onErrorCallback) {
-        onErrorCallback(error instanceof Error ? error : new Error(String(error)));
+  const fetchMine = async () => {
+    const { data, error } = await supabase
+      .from('businesses')
+      .select('*')
+      .eq('owner_id', ownerUid)
+      .order('created_at', { ascending: false });
+
+    if (cancelled) return;
+    if (error) {
+      if (isMissingSupabaseTableError(error)) {
+        onErrorCallback?.(makeSchemaMissingError());
+        return;
       }
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        // Logged structured FirestoreErrorInfo for diagnostics
-      }
+      onErrorCallback?.(new Error(error.message));
+      return;
     }
-  );
+
+    onBusinesses((data ?? []).map((r) => mapRowToBusiness(r as Record<string, unknown>)));
+  };
+
+  void fetchMine();
+
+  const channel = supabase
+    .channel(`owner_biz_${ownerUid}_${Math.random().toString(36).slice(2, 7)}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'businesses',
+        filter: `owner_id=eq.${ownerUid}`,
+      },
+      () => {
+        void fetchMine();
+      }
+    )
+    .subscribe();
+
+  return () => {
+    cancelled = true;
+    void supabase.removeChannel(channel);
+  };
 }
 
 export function subscribeBusinessSessions(
@@ -783,45 +791,67 @@ export function subscribeBusinessSessions(
   onSessions: (events: RealSessionEventRecord[]) => void,
   onErrorCallback?: (err: Error) => void
 ): Unsubscribe {
-  const path = `businesses/${slug}/sessions`;
-  const q = query(
-    collection(db, 'businesses', slug, 'sessions'),
-    where('businessOwnerId', '==', ownerUid),
-    limit(250)
-  );
+  let cancelled = false;
 
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const items: RealSessionEventRecord[] = snapshot.docs
-        .map((d) => {
-          const data = d.data() as Record<string, unknown>;
-          return {
-            id: d.id,
-            businessSlug: String(data.businessSlug ?? slug),
-            businessOwnerId: String(data.businessOwnerId ?? ownerUid),
-            visitId: String(data.visitId ?? d.id),
-            rating: Number(data.rating ?? 5),
-            language: (data.language as ReviewLanguage) ?? 'English',
-            usedOptionalPrompts: Boolean(data.usedOptionalPrompts),
-            stage: (data.stage as SessionStage) ?? 'draft_generated',
-            createdAtMs: toMillis(data.createdAt),
-          };
-        })
-        .sort((a, b) => b.createdAtMs - a.createdAtMs);
-      onSessions(items);
-    },
-    (error) => {
-      if (onErrorCallback) {
-        onErrorCallback(error instanceof Error ? error : new Error(String(error)));
+  const fetchEvents = async () => {
+    const { data, error } = await supabase
+      .from('review_sessions')
+      .select('*')
+      .eq('business_slug', slug)
+      .eq('business_owner_id', ownerUid)
+      .order('created_at', { ascending: false })
+      .limit(250);
+
+    if (cancelled) return;
+    if (error) {
+      if (isMissingSupabaseTableError(error)) {
+        onErrorCallback?.(makeSchemaMissingError());
+        return;
       }
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        // Logged structured FirestoreErrorInfo for diagnostics
-      }
+      onErrorCallback?.(new Error(error.message));
+      return;
     }
-  );
+
+    const items: RealSessionEventRecord[] = (data ?? []).map((raw) => {
+      const r = raw as Record<string, unknown>;
+      return {
+        id: String(r.id ?? ''),
+        businessSlug: String(r.business_slug ?? slug),
+        businessOwnerId: String(r.business_owner_id ?? ownerUid),
+        visitId: String(r.visit_id ?? ''),
+        rating: Number(r.rating ?? 5),
+        language: (r.language as ReviewLanguage) ?? 'English',
+        usedOptionalPrompts: Boolean(r.used_optional_prompts),
+        stage: (r.stage as SessionStage) ?? 'draft_generated',
+        createdAtMs: isoToMillis(r.created_at),
+      };
+    });
+
+    onSessions(items);
+  };
+
+  void fetchEvents();
+
+  const channel = supabase
+    .channel(`sessions_${slug}_${Math.random().toString(36).slice(2, 7)}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'review_sessions',
+        filter: `business_slug=eq.${slug}`,
+      },
+      () => {
+        void fetchEvents();
+      }
+    )
+    .subscribe();
+
+  return () => {
+    cancelled = true;
+    void supabase.removeChannel(channel);
+  };
 }
 
 export function createAnonymousVisitId(): string {
@@ -844,47 +874,37 @@ export async function recordRealCustomerSessionEvent(params: {
   if (!params.businessOwnerId || params.rating < 1 || params.rating > 5) return;
 
   const suffix = Math.random().toString(36).slice(2, 7);
-  const sessionId = `${params.visitId}_${params.stage}_${suffix}`
-    .replace(/[^a-zA-Z0-9_-]/g, '')
-    .slice(0, 96);
+  const cleanVisitId = params.visitId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48);
+  const sessionId = `${cleanVisitId}_${params.stage}_${suffix}`.slice(0, 96);
 
-  const path = `businesses/${slug}/sessions/${sessionId}`;
+  const { error } = await supabase.from('review_sessions').insert({
+    id: sessionId,
+    business_slug: slug,
+    business_owner_id: params.businessOwnerId,
+    visit_id: cleanVisitId,
+    rating: Math.round(params.rating),
+    language: params.language,
+    used_optional_prompts: Boolean(params.usedOptionalPrompts),
+    stage: params.stage,
+  });
 
-  try {
-    await setDoc(doc(db, 'businesses', slug, 'sessions', sessionId), {
-      businessSlug: slug,
-      businessOwnerId: params.businessOwnerId,
-      visitId: params.visitId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48),
-      rating: Math.round(params.rating),
-      language: params.language,
-      usedOptionalPrompts: Boolean(params.usedOptionalPrompts),
-      stage: params.stage,
-      createdAt: serverTimestamp(),
-    });
-  } catch (error) {
-    if (isOfflineOrUnavailableError(error)) {
-      try {
-        await fetch(`/api/public/businesses/${encodeURIComponent(slug)}/sessions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            businessOwnerId: params.businessOwnerId,
-            visitId: params.visitId,
-            rating: Math.round(params.rating),
-            language: params.language,
-            usedOptionalPrompts: Boolean(params.usedOptionalPrompts),
-            stage: params.stage,
-          }),
-        });
-        return;
-      } catch {
-        return;
-      }
-    }
+  if (error) {
+    // Fallback to same-origin backend proxy if available
     try {
-      handleFirestoreError(error, OperationType.CREATE, path);
+      await fetch(`/api/public/businesses/${encodeURIComponent(slug)}/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          businessOwnerId: params.businessOwnerId,
+          visitId: cleanVisitId,
+          rating: Math.round(params.rating),
+          language: params.language,
+          usedOptionalPrompts: Boolean(params.usedOptionalPrompts),
+          stage: params.stage,
+        }),
+      });
     } catch {
-      // Logged structured error without blocking customer from copying review
+      // Non-blocking customer telemetry
     }
   }
 }
