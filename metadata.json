@@ -1,0 +1,6 @@
+{
+  "name": "ReviewEase AI",
+  "description": "AI-powered Google review generator and QR code customer feedback assistant for local businesses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

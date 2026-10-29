@@ -1,0 +1,154 @@
+{
+  "entities": {
+    "Business": {
+      "title": "Business",
+      "description": "Public merchant profile and Google review destination configuration owned by a verified merchant user.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Display name of the business shown to customers scanning the QR code.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "category": {
+          "type": "string",
+          "description": "Business category such as Cafe & Restaurant, Dental Clinic, Salon, or Retail Store.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "slug": {
+          "type": "string",
+          "description": "Unique URL-safe identifier matching the document ID used in /review/{slug}.",
+          "minLength": 2,
+          "maxLength": 60,
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "locationLabel": {
+          "type": "string",
+          "description": "Optional public neighborhood or city label displayed under the business name.",
+          "minLength": 0,
+          "maxLength": 80
+        },
+        "googleReviewUrl": {
+          "type": "string",
+          "description": "Official Google Maps / Google Business Profile write-a-review URL.",
+          "minLength": 10,
+          "maxLength": 500,
+          "pattern": "^https?://.+"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the merchant owner. Immutable after creation.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "Whether the public customer review page is active for QR scans."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the business profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the business profile was last updated."
+        }
+      },
+      "required": [
+        "name",
+        "category",
+        "slug",
+        "locationLabel",
+        "googleReviewUrl",
+        "ownerId",
+        "isActive",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ReviewSessionEvent": {
+      "title": "ReviewSessionEvent",
+      "description": "Immutable anonymous telemetry event recorded during a customer QR review-drafting session.",
+      "type": "object",
+      "properties": {
+        "businessSlug": {
+          "type": "string",
+          "description": "Slug of the parent business document.",
+          "minLength": 2,
+          "maxLength": 60,
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "businessOwnerId": {
+          "type": "string",
+          "description": "Owner UID copied from the parent business document and verified on creation for zero-cost secure owner list queries.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "visitId": {
+          "type": "string",
+          "description": "Ephemeral anonymous visit identifier grouping draft, copy, and Google link steps from one QR scan.",
+          "minLength": 8,
+          "maxLength": 48,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "rating": {
+          "type": "integer",
+          "description": "Customer-selected star rating from 1 to 5."
+        },
+        "language": {
+          "type": "string",
+          "description": "Language chosen for review generation.",
+          "enum": ["English", "Hindi", "Hinglish"],
+          "minLength": 5,
+          "maxLength": 12
+        },
+        "usedOptionalPrompts": {
+          "type": "boolean",
+          "description": "Whether the customer supplied optional experience notes."
+        },
+        "stage": {
+          "type": "string",
+          "description": "Step reached in the customer workflow (never claims Google publication).",
+          "enum": ["draft_generated", "copied_review", "opened_google"],
+          "minLength": 12,
+          "maxLength": 20
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the anonymous event occurred."
+        }
+      },
+      "required": [
+        "businessSlug",
+        "businessOwnerId",
+        "visitId",
+        "rating",
+        "language",
+        "usedOptionalPrompts",
+        "stage",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/businesses/{businessSlug}": {
+      "schema": {
+        "$ref": "#/entities/Business"
+      },
+      "description": "Top-level collection of merchant profiles keyed by unique URL slug."
+    },
+    "/businesses/{businessSlug}/sessions/{sessionId}": {
+      "schema": {
+        "$ref": "#/entities/ReviewSessionEvent"
+      },
+      "description": "Append-only subcollection of anonymous customer review-drafting events belonging to a business."
+    }
+  }
+}

@@ -1,0 +1,215 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Hardened Global Primitives
+    // =========================================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidSlug(slug) {
+      return slug is string
+        && slug.size() >= 2
+        && slug.size() <= 60
+        && slug != 'demo'
+        && slug.matches('^[a-z0-9-]+$');
+    }
+
+    // =========================================================================
+    // Entity Validation Blueprints (Synchronized with firebase-blueprint.json)
+    // =========================================================================
+
+    function isValidBusinessShape(data, slugParam) {
+      return data.keys().hasAll([
+          'name',
+          'category',
+          'slug',
+          'locationLabel',
+          'googleReviewUrl',
+          'ownerId',
+          'isActive',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'name',
+          'category',
+          'slug',
+          'locationLabel',
+          'googleReviewUrl',
+          'ownerId',
+          'isActive',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 60
+        && data.slug is string && data.slug == slugParam && isValidSlug(data.slug)
+        && data.locationLabel is string && data.locationLabel.size() <= 80
+        && data.googleReviewUrl is string
+        && data.googleReviewUrl.size() >= 10
+        && data.googleReviewUrl.size() <= 500
+        && data.googleReviewUrl.matches('^https?://.+')
+        && data.ownerId is string
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.isActive is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSessionEventShape(data, slugParam) {
+      return data.keys().hasAll([
+          'businessSlug',
+          'businessOwnerId',
+          'visitId',
+          'rating',
+          'language',
+          'usedOptionalPrompts',
+          'stage',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'businessSlug',
+          'businessOwnerId',
+          'visitId',
+          'rating',
+          'language',
+          'usedOptionalPrompts',
+          'stage',
+          'createdAt'
+        ])
+        && data.businessSlug is string && data.businessSlug == slugParam && isValidSlug(data.businessSlug)
+        && data.businessOwnerId is string && isValidId(data.businessOwnerId)
+        && data.visitId is string && data.visitId.size() >= 8 && data.visitId.size() <= 48 && data.visitId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.rating is int && data.rating >= 1 && data.rating <= 5
+        && data.language is string && data.language.size() >= 5 && data.language.size() <= 12
+        && data.language in ['English', 'Hindi', 'Hinglish']
+        && data.usedOptionalPrompts is bool
+        && data.stage is string && data.stage.size() >= 12 && data.stage.size() <= 20
+        && data.stage in ['draft_generated', 'copied_review', 'opened_google']
+        && data.createdAt is timestamp
+        && data.createdAt == request.time;
+    }
+
+    // =========================================================================
+    // Collection: /businesses/{businessSlug}
+    // =========================================================================
+
+    match /businesses/{businessSlug} {
+      // Single-document QR scan resolution:
+      // Allows checking slug availability / missing slug (resource == null),
+      // reading active businesses publicly, or reading paused businesses by their verified owner.
+      allow get: if isValidSlug(businessSlug) && (
+        resource == null ||
+        existing().isActive == true ||
+        (isVerifiedUser() && existing().ownerId == request.auth.uid)
+      );
+
+      // Secure List Query: Strictly restricts queries to the verified owner's own businesses
+      allow list: if isVerifiedUser() && resource.data.ownerId == request.auth.uid;
+
+      // Create: Verified owner only, strict key/type/size validation, server timestamps
+      allow create: if isVerifiedUser()
+        && isValidSlug(businessSlug)
+        && isValidBusinessShape(incoming(), businessSlug)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      // Action-Based Update: Begins with schema validation helper, enforces immutable fields,
+      // and splits updates into explicit affectedKeys() action gates
+      allow update: if isVerifiedUser()
+        && isValidSlug(businessSlug)
+        && isValidBusinessShape(incoming(), businessSlug)
+        && resource != null
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().slug == existing().slug
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Edit profile details and Google review URL
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'category',
+            'locationLabel',
+            'googleReviewUrl',
+            'updatedAt'
+          ]) ||
+          // Action 2: Pause or resume QR page availability
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'isActive',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidSlug(businessSlug)
+        && resource != null
+        && existing().ownerId == request.auth.uid;
+
+      // =======================================================================
+      // Subcollection: /businesses/{businessSlug}/sessions/{sessionId}
+      // =======================================================================
+
+      match /sessions/{sessionId} {
+        // Master Gate single-document read for verified owner
+        allow get: if isVerifiedUser()
+          && isValidSlug(businessSlug)
+          && isValidId(sessionId)
+          && resource != null
+          && existing().businessOwnerId == request.auth.uid
+          && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.ownerId == request.auth.uid;
+
+        // Cost-optimized owner list query (no get() inside list!)
+        allow list: if isVerifiedUser()
+          && resource.data.businessOwnerId == request.auth.uid;
+
+        // Append-only anonymous QR customer session event creation:
+        // Static validation runs BEFORE parent get() to guard against Denial-of-Wallet
+        allow create: if isValidSlug(businessSlug)
+          && isValidId(sessionId)
+          && isValidSessionEventShape(incoming(), businessSlug)
+          && exists(/databases/$(database)/documents/businesses/$(businessSlug))
+          && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.isActive == true
+          && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.ownerId == incoming().businessOwnerId;
+
+        // Immutable telemetry log — prevents any Update-Gap tampering
+        allow update: if false;
+
+        // Verified owner can clear session history if desired
+        allow delete: if isVerifiedUser()
+          && isValidSlug(businessSlug)
+          && isValidId(sessionId)
+          && resource != null
+          && existing().businessOwnerId == request.auth.uid
+          && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.ownerId == request.auth.uid;
+      }
+    }
+  }
+}
