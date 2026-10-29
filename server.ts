@@ -1,6 +1,16 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import dotenv from 'dotenv';
 import express, { type Request, type Response } from 'express';
+import { initializeApp, type FirebaseApp } from 'firebase/app';
+import {
+  doc,
+  getDoc,
+  getFirestore,
+  serverTimestamp,
+  setDoc,
+  Timestamp,
+  type Firestore,
+} from 'firebase/firestore';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -19,6 +29,15 @@ interface GenerateReviewBody {
   primaryAnswer?: string;
   secondaryAnswer?: string;
   variationSeed?: number;
+}
+
+interface SessionFallbackBody {
+  businessOwnerId?: string;
+  visitId?: string;
+  rating?: number;
+  language?: 'English' | 'Hindi' | 'Hinglish';
+  usedOptionalPrompts?: boolean;
+  stage?: 'draft_generated' | 'copied_review' | 'opened_google';
 }
 
 function isGeminiConfigured(): boolean {
@@ -47,7 +66,45 @@ function getGeminiClient(): GoogleGenAI | null {
   return geminiClient;
 }
 
-function buildSystemInstruction(rating: number, language: 'English' | 'Hindi' | 'Hinglish'): string {
+// Unauthenticated server-side Firestore client (strictly governed by firestore.rules)
+// used as a resilient fallback when a customer's browser blocks googleapis.com.
+let serverFirebaseApp: FirebaseApp | null = null;
+let serverFirestoreDb: Firestore | null = null;
+
+function getServerFirestore(): Firestore | null {
+  if (serverFirestoreDb) return serverFirestoreDb;
+  try {
+    const configPath = path.join(__dirname, 'firebase-applet-config.json');
+    if (!fs.existsSync(configPath)) return null;
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8')) as {
+      projectId?: string;
+      apiKey?: string;
+      appId?: string;
+      firestoreDatabaseId?: string;
+    };
+    if (!raw.projectId || !raw.apiKey) return null;
+    serverFirebaseApp = initializeApp(raw, 'server-public-proxy');
+    serverFirestoreDb = raw.firestoreDatabaseId
+      ? getFirestore(serverFirebaseApp, raw.firestoreDatabaseId)
+      : getFirestore(serverFirebaseApp);
+    return serverFirestoreDb;
+  } catch {
+    return null;
+  }
+}
+
+function toMillis(val: unknown): number {
+  if (val instanceof Timestamp) return val.toMillis();
+  if (typeof val === 'object' && val !== null && 'seconds' in val) {
+    return Number((val as { seconds: number }).seconds) * 1000;
+  }
+  return Date.now();
+}
+
+function buildSystemInstruction(
+  rating: number,
+  language: 'English' | 'Hindi' | 'Hinglish'
+): string {
   const sentimentInstruction =
     rating >= 4
       ? `The customer selected ${rating} out of 5 stars. Write in a genuinely warm, appreciative, natural tone without exaggerated advertising clichés or robotic buzzwords.`
@@ -89,6 +146,97 @@ async function startServer() {
           ? process.env.APP_URL.replace(/\/+$/, '')
           : null,
     });
+  });
+
+  // Resilient same-origin fallback for public QR scan resolution (governed by firestore.rules)
+  app.get('/api/public/businesses/:slug', async (req: Request, res: Response) => {
+    const slug = String(req.params.slug ?? '')
+      .toLowerCase()
+      .trim();
+    if (!slug || slug === 'demo' || slug.length < 2 || slug.length > 60 || !/^[a-z0-9-]+$/.test(slug)) {
+      res.status(404).json({ found: false });
+      return;
+    }
+
+    const db = getServerFirestore();
+    if (!db) {
+      res.status(503).json({ found: false });
+      return;
+    }
+
+    try {
+      const snap = await getDoc(doc(db, 'businesses', slug));
+      if (!snap.exists()) {
+        res.status(404).json({ found: false });
+        return;
+      }
+      const data = snap.data() as Record<string, unknown>;
+      res.json({
+        found: true,
+        business: {
+          name: String(data.name ?? ''),
+          category: String(data.category ?? ''),
+          slug: String(data.slug ?? slug),
+          locationLabel: String(data.locationLabel ?? ''),
+          googleReviewUrl: String(data.googleReviewUrl ?? ''),
+          ownerId: String(data.ownerId ?? ''),
+          isActive: Boolean(data.isActive),
+          planId: data.planId ? String(data.planId) : undefined,
+          subscriptionEndsAtMs:
+            typeof data.subscriptionEndsAtMs === 'number' ? data.subscriptionEndsAtMs : undefined,
+          createdAtMs: toMillis(data.createdAt),
+          updatedAtMs: toMillis(data.updatedAt),
+        },
+      });
+    } catch {
+      res.status(404).json({ found: false });
+    }
+  });
+
+  // Resilient same-origin fallback for anonymous customer QR telemetry (governed by firestore.rules)
+  app.post('/api/public/businesses/:slug/sessions', async (req: Request, res: Response) => {
+    const slug = String(req.params.slug ?? '')
+      .toLowerCase()
+      .trim();
+    const body = (req.body ?? {}) as SessionFallbackBody;
+    const db = getServerFirestore();
+
+    if (
+      !db ||
+      !slug ||
+      slug === 'demo' ||
+      !/^[a-z0-9-]+$/.test(slug) ||
+      !body.businessOwnerId ||
+      !body.visitId ||
+      !Number.isInteger(body.rating) ||
+      (body.rating ?? 0) < 1 ||
+      (body.rating ?? 0) > 5 ||
+      !['English', 'Hindi', 'Hinglish'].includes(body.language ?? '') ||
+      !['draft_generated', 'copied_review', 'opened_google'].includes(body.stage ?? '')
+    ) {
+      res.status(400).json({ ok: false });
+      return;
+    }
+
+    const suffix = Math.random().toString(36).slice(2, 7);
+    const cleanVisitId = body.visitId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48);
+    const sessionId = `${cleanVisitId}_${body.stage}_${suffix}`.slice(0, 96);
+
+    try {
+      await setDoc(doc(db, 'businesses', slug, 'sessions', sessionId), {
+        businessSlug: slug,
+        businessOwnerId: String(body.businessOwnerId).slice(0, 128),
+        visitId: cleanVisitId,
+        rating: Number(body.rating),
+        language: body.language,
+        usedOptionalPrompts: Boolean(body.usedOptionalPrompts),
+        stage: body.stage,
+        createdAt: serverTimestamp(),
+      });
+      res.json({ ok: true });
+    } catch {
+      res.status(403).json({ ok: false });
+    }
   });
 
   app.post('/api/reviews/generate', async (req: Request, res: Response) => {

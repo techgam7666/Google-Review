@@ -10,7 +10,7 @@ export function Footer() {
               ReviewEase AI
             </Link>
             <p className="text-sm text-slate-600 leading-relaxed max-w-sm">
-              Helping guests put real experiences into clear, natural words — while keeping review editing and submission strictly in the customer&apos;s hands.
+              Monthly QR review scanner platform for local shops, clinics, salons, and cafes — helping guests write genuine Google reviews in seconds.
             </p>
           </div>
 
@@ -18,23 +18,23 @@ export function Footer() {
             <h3 className="text-sm font-semibold text-slate-900">Platform</h3>
             <ul className="space-y-2 text-sm text-slate-600">
               <li>
+                <Link to="/#pricing" className="hover:text-slate-900 transition-colors">
+                  Monthly Shop Plans
+                </Link>
+              </li>
+              <li>
                 <Link to="/dashboard" className="hover:text-slate-900 transition-colors">
-                  Merchant Workspace (Live)
+                  Merchant Portal &amp; QR Setup
                 </Link>
               </li>
               <li>
                 <Link to="/review/demo" className="hover:text-slate-900 transition-colors">
-                  Customer Review Demo
+                  Customer Scanner Demo
                 </Link>
               </li>
               <li>
                 <Link to="/business-demo" className="hover:text-slate-900 transition-colors">
-                  Sandbox QR Demo
-                </Link>
-              </li>
-              <li>
-                <Link to="/#how-it-works" className="hover:text-slate-900 transition-colors">
-                  How It Works
+                  Sandbox Analytics Demo
                 </Link>
               </li>
             </ul>
@@ -49,7 +49,9 @@ export function Footer() {
         </div>
 
         <div className="pt-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-slate-500">
-          <span>© {new Date().getFullYear()} ReviewEase AI. Built for local hospitality &amp; service businesses.</span>
+          <span>
+            © {new Date().getFullYear()} ReviewEase AI. Monthly QR Scanner SaaS for local businesses.
+          </span>
           <div className="flex items-center gap-2">
             <span>English</span>
             <span aria-hidden="true">·</span>

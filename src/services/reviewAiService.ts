@@ -388,7 +388,8 @@ export async function generateCustomerReview(
       }),
     });
 
-    if (response.ok) {
+    const contentType = response.headers.get('content-type') ?? '';
+    if (response.ok && contentType.includes('application/json')) {
       const data = (await response.json()) as {
         review?: string;
         provider?: 'gemini' | 'openrouter';

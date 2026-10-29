@@ -20,6 +20,15 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
+    // Bootstrapped Founder Admin + Trusted /admins/{uid} lookup.
+    // Strictly requires email_verified == true to defeat Email Spoofing attacks.
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'techgam766@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
     function incoming() {
       return request.resource.data;
     }
@@ -38,6 +47,13 @@ service cloud.firestore {
         && slug.size() <= 60
         && slug != 'demo'
         && slug.matches('^[a-z0-9-]+$');
+    }
+
+    function isValidOptionalPaymentUrl(url) {
+      return url is string && (
+        url.size() == 0 ||
+        (url.size() >= 10 && url.size() <= 300 && url.matches('^https?://.+'))
+      );
     }
 
     // =========================================================================
@@ -64,6 +80,8 @@ service cloud.firestore {
           'googleReviewUrl',
           'ownerId',
           'isActive',
+          'planId',
+          'subscriptionEndsAtMs',
           'createdAt',
           'updatedAt'
         ])
@@ -77,8 +95,23 @@ service cloud.firestore {
         && data.googleReviewUrl.matches('^https?://.+')
         && data.ownerId is string
         && isValidId(data.ownerId)
-        && data.ownerId == request.auth.uid
+        && (data.ownerId == request.auth.uid || isAdmin())
         && data.isActive is bool
+        && (
+          !('planId' in data) || (
+            data.planId is string
+            && data.planId.size() >= 5
+            && data.planId.size() <= 10
+            && data.planId in ['trial', 'starter', 'growth', 'agency']
+          )
+        )
+        && (
+          !('subscriptionEndsAtMs' in data) || (
+            data.subscriptionEndsAtMs is int
+            && data.subscriptionEndsAtMs >= 1700000000000
+            && data.subscriptionEndsAtMs <= 4102444800000
+          )
+        )
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -117,6 +150,218 @@ service cloud.firestore {
         && data.createdAt == request.time;
     }
 
+    function isValidSubscriptionShape(data, userIdParam) {
+      return data.keys().hasAll([
+          'userId',
+          'accountLabel',
+          'planId',
+          'billingCycle',
+          'status',
+          'maxBusinesses',
+          'priceInr',
+          'paymentReference',
+          'currentPeriodEndMs',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'userId',
+          'accountLabel',
+          'planId',
+          'billingCycle',
+          'status',
+          'maxBusinesses',
+          'priceInr',
+          'paymentReference',
+          'currentPeriodEndMs',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.userId is string
+        && isValidId(data.userId)
+        && data.userId == userIdParam
+        && (data.userId == request.auth.uid || isAdmin())
+        && data.accountLabel is string && data.accountLabel.size() >= 1 && data.accountLabel.size() <= 80
+        && data.planId is string && data.planId.size() >= 5 && data.planId.size() <= 10
+        && data.planId in ['trial', 'starter', 'growth', 'agency']
+        && data.billingCycle is string && data.billingCycle.size() >= 6 && data.billingCycle.size() <= 10
+        && data.billingCycle in ['monthly', 'annual']
+        && data.status is string && data.status.size() >= 6 && data.status.size() <= 12
+        && data.status in ['trialing', 'active', 'paused', 'canceled']
+        && data.maxBusinesses is int
+        && (
+          (data.planId in ['trial', 'starter'] && data.maxBusinesses == 1) ||
+          (data.planId == 'growth' && data.maxBusinesses == 5) ||
+          (data.planId == 'agency' && data.maxBusinesses == 25)
+        )
+        && data.priceInr is int && data.priceInr >= 0 && data.priceInr <= 50000
+        && data.paymentReference is string && data.paymentReference.size() <= 80
+        && data.currentPeriodEndMs is int
+        && data.currentPeriodEndMs >= 1700000000000
+        && data.currentPeriodEndMs <= 4102444800000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBillingConfigShape(data) {
+      return data.keys().hasAll([
+          'upiId',
+          'payeeName',
+          'paymentLinkStarter',
+          'paymentLinkGrowth',
+          'paymentLinkAgency',
+          'supportContact',
+          'trialDays',
+          'updatedByUid',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'upiId',
+          'payeeName',
+          'paymentLinkStarter',
+          'paymentLinkGrowth',
+          'paymentLinkAgency',
+          'supportContact',
+          'trialDays',
+          'updatedByUid',
+          'updatedAt'
+        ])
+        && data.upiId is string && data.upiId.size() <= 80
+        && data.payeeName is string && data.payeeName.size() >= 1 && data.payeeName.size() <= 80
+        && isValidOptionalPaymentUrl(data.paymentLinkStarter)
+        && isValidOptionalPaymentUrl(data.paymentLinkGrowth)
+        && isValidOptionalPaymentUrl(data.paymentLinkAgency)
+        && data.supportContact is string && data.supportContact.size() <= 80
+        && data.trialDays is int && data.trialDays >= 0 && data.trialDays <= 30
+        && data.updatedByUid is string && isValidId(data.updatedByUid)
+        && data.updatedByUid == request.auth.uid
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAdminRoleShape(data, adminUidParam) {
+      return data.keys().hasAll(['uid', 'grantedByUid', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'grantedByUid', 'createdAt'])
+        && data.uid is string && isValidId(data.uid) && data.uid == adminUidParam
+        && data.grantedByUid is string && isValidId(data.grantedByUid) && data.grantedByUid == request.auth.uid
+        && data.createdAt is timestamp;
+    }
+
+    // =========================================================================
+    // Collection: /subscriptions/{userId}
+    // =========================================================================
+
+    match /subscriptions/{userId} {
+      allow get: if isVerifiedUser()
+        && isValidId(userId)
+        && (request.auth.uid == userId || isAdmin());
+
+      allow list: if isVerifiedUser() && (
+        resource.data.userId == request.auth.uid ||
+        (isAdmin() && resource.data.userId is string)
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidSubscriptionShape(incoming(), userId)
+        && (request.auth.uid == userId || isAdmin())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidSubscriptionShape(incoming(), userId)
+        && resource != null
+        && (existing().status != 'canceled' || isAdmin())
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          // Action 1: Merchant activates, renews, or upgrades their own subscription plan
+          (
+            existing().userId == request.auth.uid
+            && request.auth.uid == userId
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'accountLabel',
+              'planId',
+              'billingCycle',
+              'status',
+              'maxBusinesses',
+              'priceInr',
+              'paymentReference',
+              'currentPeriodEndMs',
+              'updatedAt'
+            ])
+          ) ||
+          // Action 2: Merchant cancels their own subscription
+          (
+            existing().userId == request.auth.uid
+            && request.auth.uid == userId
+            && incoming().status == 'canceled'
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(userId) && resource != null;
+    }
+
+    // =========================================================================
+    // Collection: /platformSettings/{configId}
+    // =========================================================================
+
+    match /platformSettings/{configId} {
+      allow get: if isVerifiedUser() && configId == 'billing';
+      allow list: if false;
+
+      allow create: if isAdmin()
+        && configId == 'billing'
+        && isValidBillingConfigShape(incoming())
+        && incoming().updatedAt == request.time;
+
+      allow update: if isAdmin()
+        && configId == 'billing'
+        && isValidBillingConfigShape(incoming())
+        && resource != null
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'upiId',
+          'payeeName',
+          'paymentLinkStarter',
+          'paymentLinkGrowth',
+          'paymentLinkAgency',
+          'supportContact',
+          'trialDays',
+          'updatedByUid',
+          'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // Collection: /admins/{adminUid}
+    // =========================================================================
+
+    match /admins/{adminUid} {
+      allow get: if isVerifiedUser()
+        && isValidId(adminUid)
+        && (request.auth.uid == adminUid || isAdmin());
+
+      allow list: if false;
+
+      allow create: if isAdmin()
+        && isValidId(adminUid)
+        && isValidAdminRoleShape(incoming(), adminUid)
+        && incoming().createdAt == request.time;
+
+      allow update: if false;
+
+      allow delete: if isAdmin() && isValidId(adminUid) && resource != null;
+    }
+
     // =========================================================================
     // Collection: /businesses/{businessSlug}
     // =========================================================================
@@ -124,71 +369,104 @@ service cloud.firestore {
     match /businesses/{businessSlug} {
       // Single-document QR scan resolution:
       // Allows checking slug availability / missing slug (resource == null),
-      // reading active businesses publicly, or reading paused businesses by their verified owner.
+      // reading active businesses publicly, or reading paused businesses by owner/admin.
       allow get: if isValidSlug(businessSlug) && (
         resource == null ||
         existing().isActive == true ||
-        (isVerifiedUser() && existing().ownerId == request.auth.uid)
+        (isVerifiedUser() && (existing().ownerId == request.auth.uid || isAdmin()))
       );
 
-      // Secure List Query: Strictly restricts queries to the verified owner's own businesses
-      allow list: if isVerifiedUser() && resource.data.ownerId == request.auth.uid;
+      // Secure List Query: Strictly restricts queries to owner's own businesses or platform admin
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerId == request.auth.uid ||
+        (isAdmin() && resource.data.ownerId is string)
+      );
 
-      // Create: Verified owner only, strict key/type/size validation, server timestamps
+      // Create: Verified owner only, requires active/trialing subscription (or admin), strict schema
       allow create: if isVerifiedUser()
         && isValidSlug(businessSlug)
         && isValidBusinessShape(incoming(), businessSlug)
+        && incoming().ownerId == request.auth.uid
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() || (
+            exists(/databases/$(database)/documents/subscriptions/$(request.auth.uid))
+            && get(/databases/$(database)/documents/subscriptions/$(request.auth.uid)).data.status in ['trialing', 'active']
+          )
+        );
 
       // Action-Based Update: Begins with schema validation helper, enforces immutable fields,
-      // and splits updates into explicit affectedKeys() action gates
+      // includes admin escape hatch, and splits merchant updates into explicit affectedKeys() gates
       allow update: if isVerifiedUser()
         && isValidSlug(businessSlug)
         && isValidBusinessShape(incoming(), businessSlug)
         && resource != null
-        && existing().ownerId == request.auth.uid
         && incoming().ownerId == existing().ownerId
         && incoming().slug == existing().slug
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action 1: Edit profile details and Google review URL
-          incoming().diff(existing()).affectedKeys().hasOnly([
-            'name',
-            'category',
-            'locationLabel',
-            'googleReviewUrl',
-            'updatedAt'
-          ]) ||
-          // Action 2: Pause or resume QR page availability
-          incoming().diff(existing()).affectedKeys().hasOnly([
-            'isActive',
-            'updatedAt'
-          ])
+          isAdmin() ||
+          // Action 1: Owner edits profile details, Google link, and synced plan metadata
+          (
+            existing().ownerId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'name',
+              'category',
+              'locationLabel',
+              'googleReviewUrl',
+              'planId',
+              'subscriptionEndsAtMs',
+              'updatedAt'
+            ])
+          ) ||
+          // Action 2: Owner pauses or resumes QR scanner availability
+          (
+            existing().ownerId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'isActive',
+              'updatedAt'
+            ])
+          ) ||
+          // Action 3: Owner syncs subscription renewal onto existing shop
+          (
+            existing().ownerId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'planId',
+              'subscriptionEndsAtMs',
+              'isActive',
+              'updatedAt'
+            ])
+          )
         );
 
       allow delete: if isVerifiedUser()
         && isValidSlug(businessSlug)
         && resource != null
-        && existing().ownerId == request.auth.uid;
+        && (existing().ownerId == request.auth.uid || isAdmin());
 
       // =======================================================================
       // Subcollection: /businesses/{businessSlug}/sessions/{sessionId}
       // =======================================================================
 
       match /sessions/{sessionId} {
-        // Master Gate single-document read for verified owner
         allow get: if isVerifiedUser()
           && isValidSlug(businessSlug)
           && isValidId(sessionId)
           && resource != null
-          && existing().businessOwnerId == request.auth.uid
-          && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.ownerId == request.auth.uid;
+          && (
+            isAdmin() || (
+              existing().businessOwnerId == request.auth.uid
+              && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.ownerId == request.auth.uid
+            )
+          );
 
-        // Cost-optimized owner list query (no get() inside list!)
-        allow list: if isVerifiedUser()
-          && resource.data.businessOwnerId == request.auth.uid;
+        // Cost-optimized owner/admin list query (zero get() inside list!)
+        allow list: if isVerifiedUser() && (
+          resource.data.businessOwnerId == request.auth.uid ||
+          (isAdmin() && resource.data.businessOwnerId is string)
+        );
 
         // Append-only anonymous QR customer session event creation:
         // Static validation runs BEFORE parent get() to guard against Denial-of-Wallet
@@ -199,16 +477,19 @@ service cloud.firestore {
           && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.isActive == true
           && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.ownerId == incoming().businessOwnerId;
 
-        // Immutable telemetry log — prevents any Update-Gap tampering
+        // Immutable telemetry log
         allow update: if false;
 
-        // Verified owner can clear session history if desired
         allow delete: if isVerifiedUser()
           && isValidSlug(businessSlug)
           && isValidId(sessionId)
           && resource != null
-          && existing().businessOwnerId == request.auth.uid
-          && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.ownerId == request.auth.uid;
+          && (
+            isAdmin() || (
+              existing().businessOwnerId == request.auth.uid
+              && get(/databases/$(database)/documents/businesses/$(businessSlug)).data.ownerId == request.auth.uid
+            )
+          );
       }
     }
   }

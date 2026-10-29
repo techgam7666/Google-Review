@@ -122,16 +122,22 @@ export function BusinessProvider({ children }: { children: React.ReactNode }) {
     return [];
   });
 
-  const [liveAiConfigured, setLiveAiConfigured] = useState<boolean>(true);
+  const [liveAiConfigured, setLiveAiConfigured] = useState<boolean>(false);
   const [activeAiProvider, setActiveAiProvider] = useState<'gemini' | 'openrouter' | 'fallback'>(
-    'gemini'
+    'fallback'
   );
   const [serverAppUrl, setServerAppUrl] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
     fetch('/api/config/status')
-      .then((res) => (res.ok ? res.json() : null))
+      .then((res) => {
+        const contentType = res.headers.get('content-type') ?? '';
+        if (!res.ok || !contentType.includes('application/json')) {
+          return null;
+        }
+        return res.json();
+      })
       .then(
         (
           data: {
@@ -140,17 +146,22 @@ export function BusinessProvider({ children }: { children: React.ReactNode }) {
             appUrl?: string | null;
           } | null
         ) => {
-          if (active && data) {
+          if (!active) return;
+          if (data) {
             setLiveAiConfigured(Boolean(data.liveAiConfigured));
-            if (data.activeProvider) {
-              setActiveAiProvider(data.activeProvider);
-            }
+            setActiveAiProvider(data.activeProvider ?? 'fallback');
             setServerAppUrl(data.appUrl ?? null);
+          } else {
+            setLiveAiConfigured(false);
+            setActiveAiProvider('fallback');
           }
         }
       )
       .catch(() => {
-        // Offline fallback
+        if (active) {
+          setLiveAiConfigured(false);
+          setActiveAiProvider('fallback');
+        }
       });
     return () => {
       active = false;

@@ -1,11 +1,37 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
+import {
+  disableNetwork,
+  doc,
+  enableNetwork,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  setLogLevel,
+} from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
+
+// Suppress noisy internal WebChannel 10s transport timeout console.errors on
+// proxied or briefly offline networks; explicit operation errors are handled
+// and logged in structured JSON via handleFirestoreError below.
+setLogLevel('silent');
 
 const app = initializeApp(firebaseConfig);
 
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+// Force HTTP long-polling in browser environments so proxies, VPNs, HTTP/3 QUIC
+// middleboxes, and sandboxed preview iframes never buffer streaming WebChannel
+// responses and trigger 10-second offline timeouts.
+export const db =
+  typeof window !== 'undefined'
+    ? initializeFirestore(
+        app,
+        {
+          experimentalForceLongPolling: true,
+        },
+        firebaseConfig.firestoreDatabaseId
+      )
+    : getFirestore(app, firebaseConfig.firestoreDatabaseId);
+
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
@@ -41,6 +67,26 @@ export function isQuotaExceededError(error: unknown): boolean {
   return msg.includes('Quota exceeded');
 }
 
+export function isOfflineOrUnavailableError(error: unknown): boolean {
+  const code = (error as { code?: string })?.code ?? '';
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    code === 'unavailable' ||
+    msg.includes('client is offline') ||
+    msg.includes('could not reach cloud firestore') ||
+    msg.includes('unavailable')
+  );
+}
+
+export async function reconnectFirestore(): Promise<void> {
+  try {
+    await disableNetwork(db);
+  } catch {
+    // Ignore if already disabled
+  }
+  await enableNetwork(db);
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
@@ -63,17 +109,29 @@ export function handleFirestoreError(
     operationType,
     path,
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
+
+  if (!isOfflineOrUnavailableError(error)) {
+    console.error('Firestore Error: ', JSON.stringify(errInfo));
+  } else {
+    console.warn('Firestore transient network unavailable:', errInfo.path);
+  }
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Validate server connectivity on initial boot as required by Firebase architecture guidelines
+// Validate server connectivity on initial boot with automatic network recovery
 async function testConnection() {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return;
+  }
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
+    if (isOfflineOrUnavailableError(error)) {
+      try {
+        await enableNetwork(db);
+      } catch {
+        // Network will automatically resume once browser connectivity returns
+      }
     }
   }
 }

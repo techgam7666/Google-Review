@@ -40,7 +40,7 @@ export function Navbar() {
           ReviewEase AI
         </Link>
 
-        {/* Zone 2: Concise single-line navigation links */}
+        {/* Zone 2: 5 concise single-line navigation links */}
         <nav
           aria-label="Primary"
           className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600"
@@ -53,11 +53,11 @@ export function Navbar() {
             How It Works
           </a>
           <a
-            href="/#features"
-            onClick={(e) => handleSectionLink(e, 'features')}
+            href="/#pricing"
+            onClick={(e) => handleSectionLink(e, 'pricing')}
             className="hover:text-slate-950 hover:underline underline-offset-4 transition-colors duration-150 whitespace-nowrap shrink-0"
           >
-            Features
+            Pricing
           </a>
           <Link
             to="/review/demo"
@@ -91,7 +91,7 @@ export function Navbar() {
             to="/dashboard"
             className="hidden sm:inline-flex items-center justify-center px-4 py-2 text-sm font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors duration-150 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
           >
-            {user ? 'My Workspace' : 'Get Started'}
+            {user ? 'My Workspace' : 'Start Subscription'}
           </Link>
 
           <button
@@ -117,11 +117,11 @@ export function Navbar() {
             How It Works
           </a>
           <a
-            href="/#features"
-            onClick={(e) => handleSectionLink(e, 'features')}
+            href="/#pricing"
+            onClick={(e) => handleSectionLink(e, 'pricing')}
             className="block px-3 py-2.5 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-slate-950"
           >
-            Features
+            Pricing
           </a>
           <Link
             to="/review/demo"
@@ -156,7 +156,7 @@ export function Navbar() {
               onClick={() => setMobileOpen(false)}
               className="w-full inline-flex items-center justify-center px-4 py-2.5 text-sm font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors"
             >
-              {user ? 'Open My Workspace' : 'Get Started'}
+              {user ? 'Open My Workspace' : 'Start Subscription'}
             </Link>
           </div>
         </div>

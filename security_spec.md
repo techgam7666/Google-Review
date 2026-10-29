@@ -1,33 +1,33 @@
-# ReviewEase AI — Firestore Security Specification
+# ReviewEase AI — Firestore Security Specification (Monthly SaaS Edition)
 
 ## 1. Data Invariants & Relationship Mapping
 
-- **Master Source of Truth**: `/businesses/{businessSlug}` is the root authority for each merchant workspace.
-- **Zero PII Storage**: Neither `/businesses/{businessSlug}` nor `/businesses/{businessSlug}/sessions/{sessionId}` stores email addresses, phone numbers, or customer names.
-- **Business Ownership & Creation**:
-  - Only authenticated users with `email_verified == true` may create, update, list, or delete a `Business` document.
-  - On `create`, `ownerId` MUST equal `request.auth.uid`, `slug` MUST equal `{businessSlug}`, and both `createdAt` and `updatedAt` MUST equal `request.time`.
-  - Reserved slug `demo` cannot be claimed in `/businesses/demo` so the public interactive sandbox remains collision-free.
-  - On `update`, `ownerId`, `slug`, and `createdAt` are strictly immutable, `updatedAt == request.time`, and updates are restricted to explicit action allowlists (`affectedKeys().hasOnly(...)`).
+- **Master Sources of Truth**:
+  - `/subscriptions/{userId}` governs each merchant's monthly/annual SaaS plan (`trial`, `starter`, `growth`, `agency`), shop quota (`maxBusinesses`), and active status (`trialing`, `active`, `paused`, `canceled`).
+  - `/businesses/{businessSlug}` governs each shop's public QR scanner page (`/review/{businessSlug}`) and Google Maps destination link. Creating a new shop requires an active or trialing `/subscriptions/{ownerId}` document (or verified platform admin privileges).
+  - `/platformSettings/billing` stores founder payment collection configuration (UPI VPA, checkout links, trial length) writable exclusively by verified platform admins (`techgam766@gmail.com` with `email_verified == true` or `/admins/{uid}`).
+  - `/admins/{adminUid}` stores delegated admin UIDs writable only by verified admins.
+- **Zero PII Exposure**:
+  - No customer or merchant emails/phone numbers are stored in `/businesses` or `/subscriptions`.
+  - `/subscriptions/{userId}` `get` and `list` are strictly restricted to `userId == request.auth.uid` or `isAdmin()`.
+- **Terminal State & Quota Integrity**:
+  - `Subscription.maxBusinesses` is cryptographically coupled to `planId` in `isValidSubscriptionShape` (`trial`/`starter` -> `1`, `growth` -> `5`, `agency` -> `25`) so clients cannot spoof higher shop quotas.
+  - Once `Subscription.status == 'canceled'`, updates are locked unless overridden by `isAdmin()`.
 - **Public QR Scan Resolution (`get` vs `list`)**:
-  - Customers scanning a QR code read `/businesses/{businessSlug}` via single-document `get`, permitted ONLY when `resource.data.isActive == true` (or when read by the verified owner).
-  - Public `list` on `/businesses` is strictly forbidden to prevent merchant directory scraping; `allow list` requires a verified user AND `resource.data.ownerId == request.auth.uid`.
-- **Anonymous Session Telemetry (`/businesses/{businessSlug}/sessions/{sessionId}`)**:
-  - Customers scanning a QR code do not log in; they may ONLY `create` append-only `ReviewSessionEvent` documents when the parent `/businesses/{businessSlug}` exists AND has `isActive == true`, AND `incoming().businessOwnerId` strictly matches `get(.../businesses/$(businessSlug)).data.ownerId`.
-  - `ReviewSessionEvent` documents are strictly immutable (`allow update: if false;`).
-  - Reading (`get` and `list`) session telemetry is strictly restricted to the verified business owner (`resource.data.businessOwnerId == request.auth.uid`), with zero `get()` calls inside `allow list`.
+  - Customers scanning a shop QR code read `/businesses/{businessSlug}` via single-document `get`, permitted ONLY when `resource.data.isActive == true` (or by the verified owner / admin).
+  - `allow list` on `/businesses` and `/subscriptions` enforces `resource.data` ownership (`ownerId == request.auth.uid` / `userId == request.auth.uid`) or `isAdmin()`, with zero `get()` calls inside `allow list`.
 
 ## 2. The "Dirty Dozen" Adversarial Payloads
 
 1. **Identity Spoofing on Business Create**: Authenticated user `uid_attacker` creates `/businesses/urban-cafe` with `ownerId: "uid_victim"` -> `PERMISSION_DENIED`.
-2. **Unverified Email Write**: Authenticated user with `email_verified: false` attempts to create `/businesses/my-cafe` -> `PERMISSION_DENIED`.
-3. **Shadow Field Injection on Create**: Valid merchant payload plus extra key `"isVerifiedMerchant": true` -> `PERMISSION_DENIED` (`hasOnly` rejection).
-4. **Slug Mismatch Poisoning**: Creating `/businesses/cafe-alpha` with payload `slug: "cafe-beta"` -> `PERMISSION_DENIED`.
-5. **Owner Takeover via Update**: Owner or attacker updates `ownerId` or `createdAt` on `/businesses/cafe-alpha` -> `PERMISSION_DENIED`.
-6. **Value Poisoning on Update**: Owner updates `googleReviewUrl` to `"javascript:alert(1)"` or a 10KB string -> `PERMISSION_DENIED` (regex & `maxLength <= 500` check in `isValidBusinessShape`).
-7. **Unauthorized Directory Scraping (`list`)**: Authenticated user executes unfiltered `getDocs(collection(db, 'businesses'))` -> `PERMISSION_DENIED` (`resource.data.ownerId == request.auth.uid` enforced).
-8. **Inactive Business Public Read**: Unauthenticated visitor calls `getDoc` on `/businesses/paused-cafe` where `isActive == false` -> `PERMISSION_DENIED`.
-9. **Orphaned Session Telemetry Write**: Unauthenticated visitor creates `/businesses/nonexistent-cafe/sessions/s1` -> `PERMISSION_DENIED` (parent `exists` & `isActive` check fails).
-10. **Spoofed Session `businessOwnerId`**: Visitor creates `/businesses/cafe-alpha/sessions/s1` with `businessOwnerId: "uid_attacker"` so attacker can list victim's analytics -> `PERMISSION_DENIED` (`get()` parent `ownerId` match fails).
-11. **Session Mutation / Tampering**: Any user attempts `updateDoc` on `/businesses/cafe-alpha/sessions/s1` -> `PERMISSION_DENIED` (`allow update: if false`).
-12. **Client Timestamp Forgery**: Creating a business or session with a backdated `createdAt` timestamp instead of `serverTimestamp()` (`request.time`) -> `PERMISSION_DENIED`.
+2. **Unsubscribed Business Creation**: Verified user without `/subscriptions/{uid}` attempts to create `/businesses/free-rider-shop` -> `PERMISSION_DENIED`.
+3. **Subscription Quota Escalation**: User creates `/subscriptions/uid_user` with `planId: "trial"` and `maxBusinesses: 25` -> `PERMISSION_DENIED`.
+4. **Admin Email Spoofing (`email_verified == false`)**: Attacker with unverified `techgam766@gmail.com` attempts to update `/platformSettings/billing` -> `PERMISSION_DENIED`.
+5. **Shadow Field Injection on Create**: Valid business or subscription payload plus extra key `"isVerifiedMerchant": true` -> `PERMISSION_DENIED` (`hasOnly` rejection).
+6. **Terminal Subscription Bypass**: User attempts to self-reactivate a `canceled` `/subscriptions/{uid}` document -> `PERMISSION_DENIED` (requires `isAdmin()`).
+7. **Unauthorized Billing Settings Tampering**: Non-admin merchant attempts to write their own `upiId` to `/platformSettings/billing` -> `PERMISSION_DENIED`.
+8. **Unauthorized Subscription Scraping (`list`)**: Merchant `uid_a` queries `/subscriptions` without `where('userId', '==', 'uid_a')` -> `PERMISSION_DENIED`.
+9. **Value Poisoning on Update**: Owner updates `googleReviewUrl` to `"javascript:alert(1)"` -> `PERMISSION_DENIED`.
+10. **Orphaned Session Telemetry Write**: Unauthenticated visitor creates `/businesses/nonexistent-cafe/sessions/s1` -> `PERMISSION_DENIED`.
+11. **Spoofed Session `businessOwnerId`**: Visitor creates `/businesses/cafe-alpha/sessions/s1` with `businessOwnerId: "uid_attacker"` -> `PERMISSION_DENIED`.
+12. **Client Timestamp Forgery**: Creating a business, subscription, or session with a forged `createdAt` timestamp instead of `request.time` -> `PERMISSION_DENIED`.

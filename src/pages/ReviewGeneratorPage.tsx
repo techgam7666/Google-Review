@@ -12,11 +12,13 @@ import {
   Sparkles,
   Star,
 } from 'lucide-react';
+import cafeHeaderImg from '../assets/images/urban_cafe_interior_1793280830493.jpg';
 import { ResilientImage } from '../components/ResilientImage';
 import { useAuth } from '../context/AuthContext';
 import { useBusiness } from '../context/BusinessContext';
 import {
   createAnonymousVisitId,
+  extractOrNormalizeGoogleUrl,
   fetchPublicBusinessBySlug,
   recordRealCustomerSessionEvent,
 } from '../services/firestoreService';
@@ -28,8 +30,6 @@ import {
 import type { RealBusinessRecord, ReviewLanguage, SentimentBucket } from '../types/review';
 import { copyTextToClipboard } from '../utils/clipboard';
 
-const CAFE_HEADER_IMAGE = '/src/assets/images/urban_cafe_interior_1793280830493.jpg';
-
 interface PromptConfig {
   q1Label: string;
   q1Placeholder: string;
@@ -39,32 +39,56 @@ interface PromptConfig {
   q2Suggestions: string[];
 }
 
-const QUESTIONS_BY_BUCKET: Record<SentimentBucket, PromptConfig> = {
-  positive: {
-    q1Label: 'What did you like?',
-    q1Placeholder: 'e.g., quality, atmosphere, specific item or service...',
-    q1Suggestions: ['great overall quality', 'welcoming atmosphere', 'clean & well-maintained', 'good value'],
-    q2Label: 'How was the service?',
-    q2Placeholder: 'e.g., polite staff, quick attention, helpful guidance...',
-    q2Suggestions: ['friendly and attentive staff', 'prompt service', 'smooth experience'],
-  },
-  neutral: {
-    q1Label: 'What went well?',
-    q1Placeholder: 'e.g., convenient location and decent quality...',
-    q1Suggestions: ['decent quality', 'comfortable space', 'helpful staff'],
-    q2Label: 'What could be improved?',
-    q2Placeholder: 'e.g., waiting time during busy hours, communication...',
-    q2Suggestions: ['shorter wait times', 'better consistency', 'faster checkout'],
-  },
-  negative: {
+function getCategoryAwarePrompts(
+  bucket: SentimentBucket,
+  category: string
+): PromptConfig {
+  const lowerCat = category.toLowerCase();
+  const isClinicOrSalon =
+    lowerCat.includes('clinic') ||
+    lowerCat.includes('beauty') ||
+    lowerCat.includes('salon') ||
+    lowerCat.includes('dental') ||
+    lowerCat.includes('spa') ||
+    lowerCat.includes('medical');
+
+  if (bucket === 'positive') {
+    return {
+      q1Label: 'What did you like?',
+      q1Placeholder: isClinicOrSalon
+        ? 'e.g., treatment results, clean clinic, comfortable care...'
+        : 'e.g., quality, ambiance, specific item or service...',
+      q1Suggestions: isClinicOrSalon
+        ? ['visible results & care', 'hygienic & calm clinic', 'clear consultation', 'good value']
+        : ['great overall quality', 'welcoming atmosphere', 'clean & well-kept', 'good value'],
+      q2Label: 'How was the service?',
+      q2Placeholder: 'e.g., polite staff, quick attention, helpful guidance...',
+      q2Suggestions: isClinicOrSalon
+        ? ['polite & knowledgeable team', 'on-time appointment', 'patient guidance']
+        : ['friendly & attentive staff', 'prompt service', 'smooth experience'],
+    };
+  }
+
+  if (bucket === 'neutral') {
+    return {
+      q1Label: 'What went well?',
+      q1Placeholder: 'e.g., convenient location and decent quality...',
+      q1Suggestions: ['decent quality', 'comfortable space', 'helpful staff'],
+      q2Label: 'What could be improved?',
+      q2Placeholder: 'e.g., waiting time during busy hours, communication...',
+      q2Suggestions: ['shorter wait times', 'better consistency', 'faster billing'],
+    };
+  }
+
+  return {
     q1Label: 'What went wrong?',
-    q1Placeholder: 'e.g., long delay, inaccurate order, poor communication...',
+    q1Placeholder: 'e.g., long delay, poor communication, below expectations...',
     q1Suggestions: ['long waiting time', 'quality below expectations', 'inattentive service'],
     q2Label: 'What should be improved?',
     q2Placeholder: 'e.g., staff responsiveness, cleanliness, timeliness...',
     q2Suggestions: ['service speed & coordination', 'attention to detail', 'basic cleanliness'],
-  },
-};
+  };
+}
 
 function isValidHttpUrl(value: string): boolean {
   try {
@@ -111,7 +135,6 @@ export function ReviewGeneratorPage() {
           setRealBusiness(found);
           setNotFoundInCloud(false);
         } else if (businessSlug === profile.slug) {
-          // Matches local /business-demo sandbox slug when not yet claimed in Cloud Firestore
           setRealBusiness(null);
           setNotFoundInCloud(false);
         } else {
@@ -142,6 +165,7 @@ export function ReviewGeneratorPage() {
         slug: realBusiness.slug,
         googleReviewUrl: realBusiness.googleReviewUrl,
         ownerId: realBusiness.ownerId,
+        subscriptionEndsAtMs: realBusiness.subscriptionEndsAtMs,
         isLiveCloud: true,
       };
     }
@@ -152,9 +176,16 @@ export function ReviewGeneratorPage() {
       slug: profile.slug,
       googleReviewUrl: profile.googleReviewUrl,
       ownerId: null,
+      subscriptionEndsAtMs: undefined,
       isLiveCloud: false,
     };
   }, [realBusiness, profile]);
+
+  const isSubscriptionExpired = Boolean(
+    activeMerchant.isLiveCloud &&
+      typeof activeMerchant.subscriptionEndsAtMs === 'number' &&
+      activeMerchant.subscriptionEndsAtMs < Date.now()
+  );
 
   // Step 1: Rating
   const [rating, setRating] = useState<number>(0);
@@ -185,7 +216,13 @@ export function ReviewGeneratorPage() {
   const step3Ref = useRef<HTMLDivElement | null>(null);
 
   const sentimentBucket: SentimentBucket | null = rating > 0 ? getSentimentBucket(rating) : null;
-  const activePrompts = sentimentBucket ? QUESTIONS_BY_BUCKET[sentimentBucket] : null;
+  const activePrompts = useMemo(
+    () =>
+      sentimentBucket
+        ? getCategoryAwarePrompts(sentimentBucket, activeMerchant.category)
+        : null,
+    [sentimentBucket, activeMerchant.category]
+  );
 
   const handleSelectRating = (newRating: number) => {
     const prevBucket = rating > 0 ? getSentimentBucket(rating) : null;
@@ -364,11 +401,12 @@ export function ReviewGeneratorPage() {
 
   const handleSaveDemoGoogleUrl = (e: React.FormEvent) => {
     e.preventDefault();
-    const cleaned = urlInput.trim();
+    const cleaned = extractOrNormalizeGoogleUrl(urlInput);
     if (!isValidHttpUrl(cleaned)) {
-      setUrlSaveNotice('Please enter a valid URL starting with https:// or http://');
+      setUrlSaveNotice('Please enter a valid Google Maps or web URL.');
       return;
     }
+    setUrlInput(cleaned);
     updateProfile({ googleReviewUrl: cleaned });
     setUrlSaveNotice('Google review destination URL updated.');
     setTimeout(() => setUrlSaveNotice(null), 3000);
@@ -393,14 +431,14 @@ export function ReviewGeneratorPage() {
         <div className="max-w-xl mx-auto px-4 sm:px-6">
           <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 text-center space-y-4">
             <h1 className="text-xl sm:text-2xl font-bold text-slate-950">
-              This business QR link is not active yet
+              This shop QR scanner is not active yet
             </h1>
             <p className="text-sm text-slate-600 leading-relaxed">
-              No active merchant page was found at{' '}
+              No active shop scanner was found at{' '}
               <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded text-slate-800">
                 /review/{businessSlug}
               </code>
-              . If you own this business, you can claim this exact URL in your workspace right now.
+              . If you own this shop, you can subscribe and claim this exact scanner URL right now.
             </p>
             <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
               <Link
@@ -427,6 +465,41 @@ export function ReviewGeneratorPage() {
     ? activeMerchant.googleReviewUrl
     : 'https://search.google.com/local/reviews?q=The+Urban+Cafe';
 
+  // Expired Monthly Subscription Screen
+  if (isSubscriptionExpired) {
+    return (
+      <div className="min-h-[calc(100vh-4rem)] bg-slate-50/70 py-14">
+        <div className="max-w-xl mx-auto px-4 sm:px-6">
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 text-center space-y-4">
+            <h1 className="text-xl sm:text-2xl font-bold text-slate-950">
+              {activeMerchant.name}
+            </h1>
+            <p className="text-sm text-slate-600 leading-relaxed">
+              AI review drafting on this QR scanner is temporarily paused while the shop&apos;s monthly ReviewEase AI subscription is awaiting renewal. You can still open their Google page directly below.
+            </p>
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+              <a
+                href={effectiveGoogleUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 transition-colors"
+              >
+                <span>Open Google Maps Page</span>
+                <ExternalLink className="w-4 h-4" />
+              </a>
+              <Link
+                to="/dashboard?tab=billing"
+                className="w-full sm:w-auto inline-flex items-center justify-center px-5 py-2.5 text-sm font-medium text-slate-700 bg-slate-100 rounded-xl hover:bg-slate-200/80 transition-colors"
+              >
+                Shop Owner? Renew Plan
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const displayedStars = hoveredRating || rating;
   const isOwnerViewing =
     Boolean(user && activeMerchant.isLiveCloud && activeMerchant.ownerId === user.uid);
@@ -439,7 +512,7 @@ export function ReviewGeneratorPage() {
           {!activeMerchant.isLiveCloud ? (
             <div className="h-28 sm:h-36 w-full relative overflow-hidden bg-slate-100">
               <ResilientImage
-                src={CAFE_HEADER_IMAGE}
+                src={cafeHeaderImg}
                 alt={`${activeMerchant.name} interior`}
                 fallbackLabel={activeMerchant.name}
                 className="w-full h-full object-cover"
@@ -478,7 +551,7 @@ export function ReviewGeneratorPage() {
                     to="/dashboard"
                     className="text-xs font-semibold text-indigo-600 hover:text-indigo-700 whitespace-nowrap shrink-0"
                   >
-                    Manage in Workspace →
+                    Manage Shop →
                   </Link>
                 )}
               </div>
@@ -514,22 +587,22 @@ export function ReviewGeneratorPage() {
             >
               <div className="flex items-center justify-between gap-2">
                 <label htmlFor="demo-google-url" className="text-xs font-semibold text-slate-800">
-                  Configurable Google Review Destination URL (Demo)
+                  Configurable Google Maps / Review URL (Demo)
                 </label>
                 <Link
                   to="/dashboard"
                   className="text-xs font-medium text-indigo-600 hover:text-indigo-700 whitespace-nowrap shrink-0"
                 >
-                  Create Real Business Page →
+                  Create Real Shop QR →
                 </Link>
               </div>
               <div className="flex flex-col sm:flex-row gap-2">
                 <input
                   id="demo-google-url"
-                  type="url"
+                  type="text"
                   value={urlInput}
                   onChange={(e) => setUrlInput(e.target.value)}
-                  placeholder="https://search.google.com/local/writereview?placeid=..."
+                  placeholder="https://maps.app.goo.gl/... or https://g.page/r/.../review"
                   className="flex-1 min-w-0 px-3 py-2 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent"
                 />
                 <button
@@ -542,7 +615,7 @@ export function ReviewGeneratorPage() {
               {urlSaveNotice && (
                 <p
                   className={`text-xs ${
-                    urlSaveNotice.includes('valid URL') ? 'text-red-600' : 'text-emerald-700'
+                    urlSaveNotice.includes('valid') ? 'text-red-600' : 'text-emerald-700'
                   }`}
                 >
                   {urlSaveNotice}
@@ -643,7 +716,7 @@ export function ReviewGeneratorPage() {
                   2. Share a few quick details
                 </h2>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Both questions are optional. Add a few words or skip straight to generating your draft.
+                  Both questions are optional. Tap quick suggestions or skip straight to generating your review.
                 </p>
               </div>
               <span className="text-xs text-slate-500">Optional</span>
@@ -764,10 +837,10 @@ export function ReviewGeneratorPage() {
         {rating === 0 && (
           <div className="rounded-2xl border border-dashed border-slate-300 bg-white/60 p-6 text-center space-y-1.5">
             <p className="text-sm font-medium text-slate-700">
-              Select a star rating above to unlock tailored questions and AI review drafting
+              Select a star rating above to unlock AI review drafting
             </p>
             <p className="text-xs text-slate-500">
-              Supports 1-star through 5-star reviews in English, Hindi, and Hinglish.
+              Supports 1-star through 5-star reviews in English, हिन्दी, and Hinglish.
             </p>
           </div>
         )}
@@ -833,7 +906,7 @@ export function ReviewGeneratorPage() {
                   <span>
                     {generationSource === 'gemini' || generationSource === 'openrouter'
                       ? 'Drafted with live AI'
-                      : 'Drafted in offline fallback mode'}
+                      : 'AI-assisted draft'}
                   </span>
                   <span aria-hidden="true">·</span>
                   <span>{rating}-star sentiment</span>
@@ -892,10 +965,10 @@ export function ReviewGeneratorPage() {
           >
             <div className="space-y-1">
               <h2 id="step-4-heading" className="text-base sm:text-lg font-semibold text-slate-900">
-                4. Copy &amp; post on Google Reviews
+                4. Copy &amp; post on Google Maps
               </h2>
               <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
-                Copy your review text below, then open Google Reviews to paste, double-check, and publish it under your own Google account.
+                Copy your review text below, then open Google Maps / Reviews to paste, double-check, and submit it under your own Google account.
               </p>
             </div>
 
@@ -929,13 +1002,13 @@ export function ReviewGeneratorPage() {
                 onClick={handleOpenGoogleClick}
                 className="flex-1 inline-flex items-center justify-center gap-2 px-5 py-3 text-sm font-semibold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
               >
-                <span>Open Google Reviews</span>
+                <span>Open Google Maps</span>
                 <ExternalLink className="w-4 h-4" />
               </a>
             </div>
 
             <p className="text-xs text-slate-500 leading-relaxed">
-              ReviewEase AI never automatically publishes reviews. You always review and submit the post yourself directly on Google.
+              ReviewEase AI never automatically publishes reviews. You always paste and submit your review directly on Google.
             </p>
           </section>
         )}

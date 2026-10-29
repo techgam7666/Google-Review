@@ -4,6 +4,54 @@ export type SentimentBucket = 'positive' | 'neutral' | 'negative';
 
 export type SessionStage = 'draft_generated' | 'copied_review' | 'opened_google';
 
+export type SubscriptionPlanId = 'trial' | 'starter' | 'growth' | 'agency';
+
+export type PaidPlanId = 'starter' | 'growth' | 'agency';
+
+export type BillingCycle = 'monthly' | 'annual';
+
+export type SubscriptionStatus = 'trialing' | 'active' | 'paused' | 'canceled';
+
+export type QrStandeeTheme = 'classic' | 'navy' | 'gold';
+
+export interface SubscriptionPlanCatalogItem {
+  id: PaidPlanId;
+  name: string;
+  audience: string;
+  monthlyPriceInr: number;
+  annualMonthlyEquivalentInr: number;
+  annualTotalInr: number;
+  maxBusinesses: number;
+  popular?: boolean;
+  highlights: string[];
+}
+
+export interface MerchantSubscriptionRecord {
+  userId: string;
+  accountLabel: string;
+  planId: SubscriptionPlanId;
+  billingCycle: BillingCycle;
+  status: SubscriptionStatus;
+  maxBusinesses: number;
+  priceInr: number;
+  paymentReference: string;
+  currentPeriodEndMs: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface PlatformBillingConfigRecord {
+  upiId: string;
+  payeeName: string;
+  paymentLinkStarter: string;
+  paymentLinkGrowth: string;
+  paymentLinkAgency: string;
+  supportContact: string;
+  trialDays: number;
+  updatedByUid: string;
+  updatedAtMs: number;
+}
+
 export interface BusinessProfile {
   name: string;
   category: string;
@@ -20,6 +68,8 @@ export interface RealBusinessRecord {
   googleReviewUrl: string;
   ownerId: string;
   isActive: boolean;
+  planId?: SubscriptionPlanId;
+  subscriptionEndsAtMs?: number;
   createdAtMs: number;
   updatedAtMs: number;
 }
