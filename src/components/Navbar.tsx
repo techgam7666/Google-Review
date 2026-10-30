@@ -25,6 +25,7 @@ export function Navbar() {
   };
 
   const isWorkspacePage = location.pathname === '/dashboard';
+  const isAnalyticsPage = location.pathname === '/admin';
 
   return (
     <header className="sticky top-0 z-40 bg-white/95 backdrop-blur border-b border-slate-200/80">
@@ -72,6 +73,16 @@ export function Navbar() {
           >
             Merchant Portal
           </Link>
+          {user && (
+            <Link
+              to="/admin"
+              className={`hover:text-slate-950 hover:underline underline-offset-4 transition-colors duration-150 whitespace-nowrap shrink-0 ${
+                isAnalyticsPage ? 'text-indigo-600 font-semibold' : ''
+              }`}
+            >
+              Analytics
+            </Link>
+          )}
         </nav>
 
         {/* Zone 3: 1 primary CTA on desktop + mobile toggle */}
@@ -128,6 +139,17 @@ export function Navbar() {
           >
             Merchant Portal
           </Link>
+          {user && (
+            <Link
+              to="/admin"
+              onClick={() => setMobileOpen(false)}
+              className={`block px-3 py-2.5 rounded-lg text-sm font-medium ${
+                isAnalyticsPage ? 'bg-indigo-50 text-indigo-700 font-semibold' : 'text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              Analytics
+            </Link>
+          )}
           <div className="pt-2">
             <Link
               to="/dashboard"

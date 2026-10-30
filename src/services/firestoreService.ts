@@ -357,6 +357,11 @@ export async function fetchPlatformBillingConfig(): Promise<PlatformBillingConfi
   };
 }
 
+async function getCurrentAccessToken(): Promise<string | null> {
+  const { data } = await supabase.auth.getSession();
+  return data.session?.access_token ?? null;
+}
+
 export async function savePlatformBillingConfig(input: {
   upiId: string;
   payeeName: string;
@@ -377,16 +382,43 @@ export async function savePlatformBillingConfig(input: {
     return t;
   };
 
+  const normalizedPayload = {
+    upiId: input.upiId.trim().slice(0, 80),
+    payeeName: (input.payeeName.trim() || 'ReviewEase AI').slice(0, 80),
+    paymentLinkStarter: cleanOptionalUrl(input.paymentLinkStarter),
+    paymentLinkGrowth: cleanOptionalUrl(input.paymentLinkGrowth),
+    paymentLinkAgency: cleanOptionalUrl(input.paymentLinkAgency),
+    supportContact: input.supportContact.trim().slice(0, 80),
+    trialDays: Math.max(0, Math.min(30, Math.round(input.trialDays))),
+  };
+
+  const token = await getCurrentAccessToken();
+  if (token) {
+    try {
+      const apiRes = await fetch('/api/admin/billing-config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(normalizedPayload),
+      });
+      if (apiRes.ok) return;
+    } catch {
+      // Static deploy fallback
+    }
+  }
+
   const { error } = await supabase.from('platform_settings').upsert(
     {
       id: 'billing',
-      upi_id: input.upiId.trim().slice(0, 80),
-      payee_name: (input.payeeName.trim() || 'ReviewEase AI').slice(0, 80),
-      payment_link_starter: cleanOptionalUrl(input.paymentLinkStarter),
-      payment_link_growth: cleanOptionalUrl(input.paymentLinkGrowth),
-      payment_link_agency: cleanOptionalUrl(input.paymentLinkAgency),
-      support_contact: input.supportContact.trim().slice(0, 80),
-      trial_days: Math.max(0, Math.min(30, Math.round(input.trialDays))),
+      upi_id: normalizedPayload.upiId,
+      payee_name: normalizedPayload.payeeName,
+      payment_link_starter: normalizedPayload.paymentLinkStarter,
+      payment_link_growth: normalizedPayload.paymentLinkGrowth,
+      payment_link_agency: normalizedPayload.paymentLinkAgency,
+      support_contact: normalizedPayload.supportContact,
+      trial_days: normalizedPayload.trialDays,
       updated_by_uid: currentUser.id,
       updated_at: new Date().toISOString(),
     },
@@ -402,7 +434,7 @@ export async function savePlatformBillingConfig(input: {
 }
 
 // ============================================================================
-// Founder Admin Console Services (Governed by Supabase RLS is_founder_admin())
+// Founder Admin Console Services (Governed by Admin API + Supabase RLS)
 // ============================================================================
 
 export function subscribeAllPlatformSubscriptions(
@@ -412,6 +444,25 @@ export function subscribeAllPlatformSubscriptions(
   let cancelled = false;
 
   const fetchAll = async () => {
+    const token = await getCurrentAccessToken();
+    if (token) {
+      try {
+        const res = await fetch('/api/admin/subscriptions', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const ct = res.headers.get('content-type') ?? '';
+        if (res.ok && ct.includes('application/json')) {
+          const payload = (await res.json()) as { items?: Array<Record<string, unknown>> };
+          if (!cancelled && Array.isArray(payload.items)) {
+            onList(payload.items.map((r) => mapRowToSubscription(r)));
+            return;
+          }
+        }
+      } catch {
+        // Fall through to direct Supabase query
+      }
+    }
+
     const { data, error } = await supabase
       .from('subscriptions')
       .select('*')
@@ -457,6 +508,25 @@ export function subscribeAllPlatformBusinesses(
   let cancelled = false;
 
   const fetchAll = async () => {
+    const token = await getCurrentAccessToken();
+    if (token) {
+      try {
+        const res = await fetch('/api/admin/businesses', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const ct = res.headers.get('content-type') ?? '';
+        if (res.ok && ct.includes('application/json')) {
+          const payload = (await res.json()) as { items?: Array<Record<string, unknown>> };
+          if (!cancelled && Array.isArray(payload.items)) {
+            onList(payload.items.map((r) => mapRowToBusiness(r)));
+            return;
+          }
+        }
+      } catch {
+        // Fall through to direct Supabase query
+      }
+    }
+
     const { data, error } = await supabase
       .from('businesses')
       .select('*')
@@ -505,13 +575,37 @@ export async function adminUpdateMerchantSubscription(
   const nextEndMs = updates.addDays
     ? baseMs + updates.addDays * 24 * 60 * 60 * 1000
     : targetSub.currentPeriodEndMs;
+  const maxBusinesses = getMaxBusinessesForPlan(nextPlan);
+
+  const token = await getCurrentAccessToken();
+  if (token) {
+    try {
+      const apiRes = await fetch('/api/admin/subscriptions/update', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          userId: targetSub.userId,
+          planId: nextPlan,
+          status: nextStatus,
+          maxBusinesses,
+          currentPeriodEndMs: nextEndMs,
+        }),
+      });
+      if (apiRes.ok) return;
+    } catch {
+      // Static deploy fallback
+    }
+  }
 
   const { error } = await supabase
     .from('subscriptions')
     .update({
       plan_id: nextPlan,
       status: nextStatus,
-      max_businesses: getMaxBusinessesForPlan(nextPlan),
+      max_businesses: maxBusinesses,
       current_period_end_ms: nextEndMs,
       updated_at: new Date().toISOString(),
     })
@@ -846,6 +940,87 @@ export function subscribeBusinessSessions(
         void fetchEvents();
       }
     )
+    .subscribe();
+
+  return () => {
+    cancelled = true;
+    void supabase.removeChannel(channel);
+  };
+}
+
+export function subscribeMerchantAnalyticsSessions(
+  ownerUid: string,
+  includeAllPlatform: boolean,
+  onSessions: (events: RealSessionEventRecord[]) => void,
+  onErrorCallback?: (err: Error) => void
+): Unsubscribe {
+  let cancelled = false;
+
+  const fetchAnalyticsEvents = async () => {
+    let query = supabase
+      .from('review_sessions')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1000);
+
+    if (!includeAllPlatform) {
+      query = query.eq('business_owner_id', ownerUid);
+    }
+
+    const { data, error } = await query;
+
+    if (cancelled) return;
+    if (error) {
+      if (isMissingSupabaseTableError(error)) {
+        onErrorCallback?.(makeSchemaMissingError());
+        return;
+      }
+      onErrorCallback?.(new Error(error.message));
+      return;
+    }
+
+    const items: RealSessionEventRecord[] = (data ?? []).map((raw) => {
+      const r = raw as Record<string, unknown>;
+      return {
+        id: String(r.id ?? ''),
+        businessSlug: String(r.business_slug ?? ''),
+        businessOwnerId: String(r.business_owner_id ?? ownerUid),
+        visitId: String(r.visit_id ?? ''),
+        rating: Number(r.rating ?? 5),
+        language: (r.language as ReviewLanguage) ?? 'English',
+        usedOptionalPrompts: Boolean(r.used_optional_prompts),
+        stage: (r.stage as SessionStage) ?? 'draft_generated',
+        createdAtMs: isoToMillis(r.created_at),
+      };
+    });
+
+    onSessions(items);
+  };
+
+  void fetchAnalyticsEvents();
+
+  const channelConfig = includeAllPlatform
+    ? {
+        event: '*' as const,
+        schema: 'public',
+        table: 'review_sessions',
+      }
+    : {
+        event: '*' as const,
+        schema: 'public',
+        table: 'review_sessions',
+        filter: `business_owner_id=eq.${ownerUid}`,
+      };
+
+  const channel = supabase
+    .channel(
+      `merchant_analytics_${ownerUid}_${includeAllPlatform ? 'all' : 'own'}_${Math.random()
+        .toString(36)
+        .slice(2, 7)}`
+    )
+    .on('postgres_changes', channelConfig, () => {
+      void fetchAnalyticsEvents();
+    })
     .subscribe();
 
   return () => {

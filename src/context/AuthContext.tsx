@@ -2,7 +2,10 @@ import React, { createContext, useCallback, useContext, useEffect, useState } fr
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 
-const BOOTSTRAPPED_ADMIN_EMAIL = 'techgam766@gmail.com';
+const FOUNDER_ADMIN_EMAILS = new Set([
+  'techgam766@gmail.com',
+  'aalamnashim786@gmail.com',
+]);
 
 export interface AppUser {
   uid: string;
@@ -261,7 +264,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const isPlatformAdmin = Boolean(
-    user && user.email && user.email.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL
+    user && user.email && FOUNDER_ADMIN_EMAILS.has(user.email.toLowerCase())
   );
 
   return (

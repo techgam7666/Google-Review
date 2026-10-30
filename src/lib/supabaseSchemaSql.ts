@@ -5,7 +5,7 @@ export const SUPABASE_AUTH_PROVIDERS_URL = `https://supabase.com/dashboard/proje
 export const SUPABASE_BOOTSTRAP_SQL = `-- ReviewEase AI — Supabase PostgreSQL Schema & Row Level Security (RLS)
 create or replace function public.is_founder_admin()
 returns boolean language sql stable as $$
-  select lower(coalesce(auth.jwt() ->> 'email', '')) = 'techgam766@gmail.com';
+  select lower(coalesce(auth.jwt() ->> 'email', '')) in ('techgam766@gmail.com', 'aalamnashim786@gmail.com');
 $$;
 
 create table if not exists public.subscriptions (

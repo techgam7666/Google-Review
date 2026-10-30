@@ -262,6 +262,151 @@ async function startServer() {
     res.json({ created: true });
   });
 
+  const FOUNDER_ADMIN_EMAILS = new Set([
+    'techgam766@gmail.com',
+    'aalamnashim786@gmail.com',
+  ]);
+
+  async function verifyAdminRequest(
+    req: Request,
+    res: Response
+  ): Promise<{ sub: string; email: string } | null> {
+    const authHeader = req.headers.authorization ?? '';
+    if (!authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Missing Authorization Bearer token.' });
+      return null;
+    }
+    const token = authHeader.slice('Bearer '.length).trim();
+    const verified = await verifySupabaseJwtViaJwks(token);
+    const email = (verified?.email ?? '').toLowerCase();
+    if (!verified || !email || !FOUNDER_ADMIN_EMAILS.has(email)) {
+      res.status(403).json({ error: 'Founder Admin privileges required.' });
+      return null;
+    }
+    return { sub: verified.sub, email };
+  }
+
+  app.get('/api/admin/subscriptions', async (req: Request, res: Response) => {
+    const admin = await verifyAdminRequest(req, res);
+    if (!admin) return;
+    const sb = getSupabaseServer();
+    if (!sb) {
+      res.status(503).json({ error: 'Supabase server client not configured.' });
+      return;
+    }
+    const { data, error } = await sb
+      .from('subscriptions')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .limit(200);
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+    res.json({ items: data ?? [] });
+  });
+
+  app.get('/api/admin/businesses', async (req: Request, res: Response) => {
+    const admin = await verifyAdminRequest(req, res);
+    if (!admin) return;
+    const sb = getSupabaseServer();
+    if (!sb) {
+      res.status(503).json({ error: 'Supabase server client not configured.' });
+      return;
+    }
+    const { data, error } = await sb
+      .from('businesses')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+    res.json({ items: data ?? [] });
+  });
+
+  app.post('/api/admin/billing-config', async (req: Request, res: Response) => {
+    const admin = await verifyAdminRequest(req, res);
+    if (!admin) return;
+    const sb = getSupabaseServer();
+    if (!sb) {
+      res.status(503).json({ error: 'Supabase server client not configured.' });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const { error } = await sb.from('platform_settings').upsert(
+      {
+        id: 'billing',
+        upi_id: String(body.upiId ?? '').trim().slice(0, 80),
+        payee_name: (String(body.payeeName ?? '').trim() || 'ReviewEase AI').slice(0, 80),
+        payment_link_starter: String(body.paymentLinkStarter ?? '').trim().slice(0, 300),
+        payment_link_growth: String(body.paymentLinkGrowth ?? '').trim().slice(0, 300),
+        payment_link_agency: String(body.paymentLinkAgency ?? '').trim().slice(0, 300),
+        support_contact: String(body.supportContact ?? '').trim().slice(0, 80),
+        trial_days: Math.max(0, Math.min(30, Math.round(Number(body.trialDays ?? 7)))),
+        updated_by_uid: admin.sub,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'id' }
+    );
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/admin/subscriptions/update', async (req: Request, res: Response) => {
+    const admin = await verifyAdminRequest(req, res);
+    if (!admin) return;
+    const sb = getSupabaseServer();
+    if (!sb) {
+      res.status(503).json({ error: 'Supabase server client not configured.' });
+      return;
+    }
+    const body = (req.body ?? {}) as {
+      userId?: string;
+      planId?: string;
+      status?: string;
+      maxBusinesses?: number;
+      currentPeriodEndMs?: number;
+    };
+    if (!body.userId || !body.planId || !body.status || !body.currentPeriodEndMs) {
+      res.status(400).json({ error: 'Missing required subscription update fields.' });
+      return;
+    }
+
+    const { error } = await sb
+      .from('subscriptions')
+      .update({
+        plan_id: body.planId,
+        status: body.status,
+        max_businesses: Number(body.maxBusinesses ?? 1),
+        current_period_end_ms: Number(body.currentPeriodEndMs),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('user_id', body.userId);
+
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    const shouldBeActive = body.status === 'active' || body.status === 'trialing';
+    await sb
+      .from('businesses')
+      .update({
+        plan_id: body.planId,
+        subscription_ends_at_ms: Number(body.currentPeriodEndMs),
+        is_active: shouldBeActive,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('owner_id', body.userId);
+
+    res.json({ ok: true });
+  });
+
   // Authenticated JWT verification health route via SUPABASE_JWKS_URL
   app.get('/api/auth/me', async (req: Request, res: Response) => {
     const authHeader = req.headers.authorization;

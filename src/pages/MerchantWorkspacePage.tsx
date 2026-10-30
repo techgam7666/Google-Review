@@ -4,6 +4,7 @@ import QRCode from 'qrcode';
 import {
   AlertCircle,
   ArrowUpRight,
+  BarChart3,
   Building2,
   Check,
   Copy,
@@ -25,6 +26,7 @@ import {
   Trash2,
   Wand2,
 } from 'lucide-react';
+import { AdminDashboard } from '../components/AdminDashboard';
 import { FounderAdminPanel } from '../components/FounderAdminPanel';
 import { SubscriptionBillingPanel } from '../components/SubscriptionBillingPanel';
 import { useAuth } from '../context/AuthContext';
@@ -86,7 +88,7 @@ const CATEGORY_SUGGESTIONS = [
   'Auto & Home Services',
 ];
 
-type WorkspaceTab = 'shops' | 'billing' | 'admin';
+type WorkspaceTab = 'shops' | 'analytics' | 'billing' | 'admin';
 
 function formatRelativeTime(timestampMs: number): string {
   const diffSec = Math.max(0, Math.floor((Date.now() - timestampMs) / 1000));
@@ -153,6 +155,8 @@ export function MerchantWorkspacePage() {
 
   const [activeTab, setActiveTab] = useState<WorkspaceTab>(() => {
     if (tabQueryParam === 'billing' || validInitialPlan) return 'billing';
+    if (tabQueryParam === 'analytics') return 'analytics';
+    if (tabQueryParam === 'admin') return 'admin';
     return 'shops';
   });
 
@@ -1174,6 +1178,21 @@ export function MerchantWorkspacePage() {
             <button
               type="button"
               role="tab"
+              aria-selected={effectiveTab === 'analytics'}
+              onClick={() => setActiveTab('analytics')}
+              className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                effectiveTab === 'analytics'
+                  ? 'bg-white text-slate-950 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <BarChart3 className="w-3.5 h-3.5" />
+              <span>Analytics</span>
+            </button>
+
+            <button
+              type="button"
+              role="tab"
               aria-selected={effectiveTab === 'billing'}
               onClick={() => setActiveTab('billing')}
               className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
@@ -1324,6 +1343,9 @@ export function MerchantWorkspacePage() {
             onBillingConfigSaved={reloadBillingConfig}
           />
         )}
+
+        {/* TAB 4: Merchant Business Analytics (Supabase) */}
+        {effectiveTab === 'analytics' && <AdminDashboard embedded />}
 
         {/* TAB 1: My Shop Scanners */}
         {effectiveTab === 'shops' && hasValidSubscription && (

@@ -10,7 +10,7 @@ returns boolean
 language sql
 stable
 as $$
-  select lower(coalesce(auth.jwt() ->> 'email', '')) = 'techgam766@gmail.com';
+  select lower(coalesce(auth.jwt() ->> 'email', '')) in ('techgam766@gmail.com', 'aalamnashim786@gmail.com');
 $$;
 
 -- 2. Merchant SaaS Subscriptions Table

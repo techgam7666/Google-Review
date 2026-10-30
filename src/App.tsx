@@ -5,6 +5,7 @@
 
 import { useEffect } from 'react';
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
+import { AdminDashboard } from './components/AdminDashboard';
 import { Footer } from './components/Footer';
 import { Navbar } from './components/Navbar';
 import { AuthProvider } from './context/AuthContext';
@@ -37,6 +38,7 @@ export default function App() {
               <Routes>
                 <Route path="/" element={<HomePage />} />
                 <Route path="/dashboard" element={<MerchantWorkspacePage />} />
+                <Route path="/admin" element={<AdminDashboard />} />
                 <Route path="/review/demo" element={<Navigate to="/dashboard" replace />} />
                 <Route path="/business-demo" element={<Navigate to="/dashboard" replace />} />
                 <Route path="/review/:businessSlug" element={<ReviewGeneratorPage />} />
